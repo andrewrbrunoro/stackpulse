@@ -1,0 +1,5 @@
+{"type":"user","sessionId":"claude-demo-001","uuid":"message-1","timestamp":"2026-09-13T09:00:00Z","message":{"role":"user","content":"Revise a documentação da API."}}
+{"type":"assistant","sessionId":"claude-demo-001","uuid":"message-2","timestamp":"2026-09-13T09:00:01Z","message":{"role":"assistant","model":"modelo-demo","content":[{"type":"text","text":"Vou conferir os exemplos e a descrição dos parâmetros."},{"type":"tool_use","id":"tool-1","name":"Read","input":{"file_path":"README.md"}}],"usage":{"input_tokens":100,"output_tokens":20}}}
+{"type":"user","sessionId":"claude-demo-001","uuid":"message-3","timestamp":"2026-09-13T09:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-1","content":"Documentação de demonstração"}]}}
+{"type":"assistant","sessionId":"claude-demo-001","uuid":"message-4","timestamp":"2026-09-13T09:00:03Z","message":{"role":"assistant","content":[{"type":"text","text":"A documentação está consistente com os exemplos."}]}}
+{"type":"custom-title","sessionId":"claude-demo-001","customTitle":"Revisar documentação","timestamp":"2026-09-13T09:00:04Z"}

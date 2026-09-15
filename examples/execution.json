@@ -1,0 +1,16 @@
+{
+  "sessions": [
+    {"id":"demo-root","parent_id":null,"name":"Orquestrador","project":"/demo","provider":"openai","created_at":"2026-09-11T12:00:00Z","source":"example"},
+    {"id":"demo-worker","parent_id":"demo-root","name":"Worker","project":"/demo","provider":"openai","created_at":"2026-09-11T12:00:10Z","source":"example"}
+  ],
+  "usage": [
+    {"id":"demo-request-1","session_id":"demo-root","turn_id":"demo-turn-1","at":"2026-09-11T12:01:00Z","model":"gpt-6-astra","effort":"xhigh","service_tier":"unknown","tokens":{"input_tokens":10000,"cached_input_tokens":5000,"cache_write_input_tokens":0,"output_tokens":2000,"reasoning_output_tokens":1000}},
+    {"id":"demo-request-2","session_id":"demo-worker","turn_id":"demo-turn-2","at":"2026-09-11T12:01:10Z","model":"gpt-5.6-luna","effort":"ultra","service_tier":"unknown","tokens":{"input_tokens":5000,"cached_input_tokens":2000,"cache_write_input_tokens":0,"output_tokens":1000,"reasoning_output_tokens":500}}
+  ],
+  "turns": [
+    {"id":"demo-turn-1","session_id":"demo-root","started_at":"2026-09-11T12:00:00Z","ended_at":"2026-09-11T12:02:00Z","status":"completed","ttft_ms":1000},
+    {"id":"demo-turn-2","session_id":"demo-worker","started_at":"2026-09-11T12:00:10Z","ended_at":"2026-09-11T12:01:10Z","status":"completed","ttft_ms":500}
+  ],
+  "annotations": [{"run_id":"demo-root","label":"Exemplo fictício: Astra + Luna","benchmark":"demo-v1","quality":0.9,"baseline":true}],
+  "prices": []
+}
