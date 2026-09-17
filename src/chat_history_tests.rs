@@ -11,6 +11,40 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 #[test]
+fn interrupted_preview_stays_excluded_when_reopening_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut history = open(dir.path());
+    let session = history.create_session(dir.path()).unwrap();
+    let turn = history
+        .start_turn(
+            &session.id,
+            "apenas prévia",
+            "selected",
+            "Prévia · preparando…",
+        )
+        .unwrap();
+    history
+        .update_turn(
+            &session.id,
+            &turn,
+            &["contexto repetido da prévia".into()],
+            "Prévia · trabalhando…",
+            None,
+            false,
+        )
+        .unwrap();
+    drop(history);
+    let mut history = open(dir.path());
+    let reopened = history.load_session(&session.id, dir.path()).unwrap();
+    assert!(
+        reopened.turns[0]
+            .status
+            .starts_with("Prévia · Interrompido")
+    );
+    assert!(history.context(&session.id).unwrap().is_empty());
+}
+
+#[test]
 fn jsonl_persists_incremental_responses_custom_titles_and_interruption() {
     let dir = tempfile::tempdir().unwrap();
     let mut history = open(dir.path());

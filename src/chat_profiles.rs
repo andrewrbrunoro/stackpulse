@@ -62,22 +62,29 @@ impl Choice {
         };
         details.push(format!(
             "Executor: {} · provider {}",
-            self.client, team.provider
+            self.client,
+            team.root_provider()
         ));
         details.push(format!(
             "Delegação: {} · até {} subagentes simultâneos",
             delegation(&team.delegation),
             self.max_agents
         ));
-        if self.client == Backend::Claude.label() && !team.agents.is_empty() {
+        if team.is_mixed() {
+            details.push("Equipe com múltiplos providers: delegação pela ponte StackPulse; cada papel usa seu CLI, modelo e esforço. Autenticação é verificada pelo CLI ao executar.".into());
+        }
+        if self.client == Backend::Claude.label() && !team.agents.is_empty() && !team.is_mixed() {
             details.push("Claude: limite de concorrência solicitado ao orquestrador, sem imposição nativa pelo adaptador.".into());
             details.push("Equipes Claude exigem workspace-write. read-only com subagentes é recusado, preservando as permissões.".into());
         }
         details.push("Os papéis abaixo pertencem ao perfil; /agents acompanha apenas agentes observados em execução.".into());
         details.push(String::new());
         details.push(format!(
-            "Orquestrador {}: {} / {}",
-            team.orchestrator.role, team.orchestrator.model, team.orchestrator.effort
+            "Orquestrador {}: {} / {} · provider {}",
+            team.orchestrator.role,
+            team.orchestrator.model,
+            team.orchestrator.effort,
+            team.root_provider()
         ));
         details.push(format!("Finalidade: {}", team.orchestrator.purpose));
         details.push(format!("Condição: {}", condition(&team.orchestrator.when)));
@@ -85,11 +92,12 @@ impl Choice {
         details.push(format!("Papéis configurados ({})", team.agents.len()));
         for (index, agent) in team.agents.iter().enumerate() {
             details.push(format!(
-                "{}. {}: {} / {}",
+                "{}. {}: {} / {} · provider {}",
                 index + 1,
                 agent.role,
                 agent.model,
-                agent.effort
+                agent.effort,
+                team.provider_for(agent)
             ));
             details.push(format!("Finalidade: {}", agent.purpose));
             details.push(format!("Condição: {}", condition(&agent.when)));
@@ -235,21 +243,24 @@ fn choice(settings: &Settings, entry: Discovered) -> Choice {
         choice.max_agents = 1;
     }
     // Match workflow::executor_settings without probing or launching a provider.
-    let client = if team.provider == settings.provider {
+    let client = if team.is_mixed() {
+        Backend::for_provider(team.root_provider())
+    } else if team.root_provider() == settings.provider {
         Some(settings.client)
     } else {
-        Backend::for_provider(&team.provider)
+        Backend::for_provider(team.root_provider())
             .or((settings.client == Backend::Codex).then_some(Backend::Codex))
     };
     choice.client = client
         .map(|client| client.label().to_string())
-        .unwrap_or_else(|| team.provider.clone());
+        .unwrap_or_else(|| team.root_provider().into());
     choice.model = team.orchestrator.model.clone();
     choice.effort = team.orchestrator.effort.clone();
     choice.subtitle = format!("{} · {} · {}", choice.client, choice.model, choice.effort);
     choice.detail.push(format!(
         "Executor: {} · provider {}",
-        choice.client, team.provider
+        choice.client,
+        team.root_provider()
     ));
     choice.detail.push(format!(
         "Orquestrador {}: {} · {}",
@@ -262,10 +273,11 @@ fn choice(settings: &Settings, entry: Discovered) -> Choice {
     ));
     for agent in team.agents.iter().take(12) {
         choice.detail.push(format!(
-            "{}: {} · {} — {}",
+            "{}: {} · {} · provider {} — {}",
             agent.role,
             agent.model,
             agent.effort,
+            team.provider_for(agent),
             line(&agent.purpose)
         ));
     }
@@ -279,21 +291,26 @@ fn choice(settings: &Settings, entry: Discovered) -> Choice {
             .detail
             .push(format!("Integração: {}", line(&team.integration)));
     }
-    if team.provider == "unknown"
-        || std::iter::once(&team.orchestrator)
-            .chain(&team.agents)
-            .any(|agent| agent.model == "unknown" || agent.effort == "unknown")
+    if std::iter::once(&team.orchestrator)
+        .chain(&team.agents)
+        .any(|agent| {
+            team.provider_for(agent) == "unknown"
+                || agent.model == "unknown"
+                || agent.effort == "unknown"
+        })
     {
         problem(
             &mut choice,
             "Perfil contém campos unknown; complete o TOML do Markdown antes de executar.".into(),
         );
+    } else if let Err(error) = team.validate_execution_providers() {
+        problem(&mut choice, error.to_string());
     } else if client.is_none() {
         problem(
             &mut choice,
             format!(
                 "Nenhum adaptador para o provider da equipe: {}",
-                team.provider
+                team.root_provider()
             ),
         );
     } else if matches!(client, Some(Backend::Cursor | Backend::Grok)) && !team.agents.is_empty() {
@@ -356,6 +373,7 @@ mod tests {
                 name: "team".into(),
                 provider: "openai".into(),
                 orchestrator: AgentSpec {
+                    provider: None,
                     role: "root".into(),
                     model: "gpt-6-astra".into(),
                     effort: "medium".into(),
@@ -452,6 +470,7 @@ mod tests {
         profile.team.delegation = "parallel".into();
         profile.team.agents = (1..=32)
             .map(|index| AgentSpec {
+                provider: None,
                 role: format!("role_{index}"),
                 model: format!("model-{index}"),
                 effort: "high".into(),
@@ -479,6 +498,39 @@ mod tests {
         assert!(details.contains("Orquestrador root: gpt-6-astra / medium"));
         assert!(details.contains("Integração: Integrar e testar"));
         assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn mixed_catalog_shows_resolved_providers_and_rejects_unroutable_roles() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = settings(temp.path());
+        let config = temp.path().join("config.json");
+        settings.save(&config).unwrap();
+        let global = settings.providers_root.join("project/all");
+        write_profile(&global);
+        let path = global.join("team.md");
+        let (mut profile, _) = profiles::read(&path).unwrap();
+        // Root override wins over the team fallback, without probing installed CLIs.
+        profile.team.provider = "xai".into();
+        profile.team.orchestrator.provider = Some("openai".into());
+        let mut child = profile.team.orchestrator.clone();
+        child.role = "worker".into();
+        child.provider = None;
+        profile.team.agents = vec![child];
+        fs::write(&path, profiles::markdown(&profile).unwrap()).unwrap();
+        let catalog = load(&config, temp.path());
+        let choice = &catalog.choices[0];
+        assert_eq!(choice.client, "Codex CLI");
+        assert!(choice.problem.is_none());
+        let details = choice.team_details().join("\n");
+        assert!(details.contains("provider openai"));
+        assert!(details.contains("provider xai"));
+        assert!(details.contains("ponte StackPulse"));
+        for provider in ["unknown", "missing_adapter"] {
+            profile.team.agents[0].provider = Some(provider.into());
+            fs::write(&path, profiles::markdown(&profile).unwrap()).unwrap();
+            assert!(load(&config, temp.path()).choices[0].problem.is_some());
+        }
     }
 
     #[test]

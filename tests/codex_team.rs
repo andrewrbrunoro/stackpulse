@@ -27,6 +27,7 @@ fn team() -> TeamSpec {
         name: "native-team".into(),
         provider: "openai".into(),
         orchestrator: AgentSpec {
+            provider: None,
             role: "root".into(),
             model: "gpt-6-astra".into(),
             effort: "medium".into(),
@@ -40,6 +41,7 @@ fn team() -> TeamSpec {
         ]
         .into_iter()
         .map(|(role, model, effort)| AgentSpec {
+            provider: None,
             role: role.into(),
             model: model.into(),
             effort: effort.into(),
@@ -263,4 +265,21 @@ fn legacy_requests_and_empty_teams_need_no_temporary_role_files() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn full_access_sets_explicit_approval_policy_without_affecting_default() {
+    let settings = settings();
+    for sandbox in ["workspace-write", "danger-full-access"] {
+        let mut req = request(&settings, None);
+        req.sandbox = sandbox;
+        let mut command = Command::new("not-executed");
+        codex::configure(&mut command, &req).unwrap();
+        let args = args(&command);
+        assert_eq!(
+            args.iter().any(|a| a == "approval_policy=\"never\""),
+            sandbox == "danger-full-access"
+        );
+        assert!(args.windows(2).any(|p| p == ["--sandbox", sandbox]));
+    }
 }

@@ -238,6 +238,7 @@ mod tests {
                 name: "team".into(),
                 provider: "openai".into(),
                 orchestrator: AgentSpec {
+                    provider: None,
                     role: "orchestrator".into(),
                     model: "fixture".into(),
                     effort: "medium".into(),

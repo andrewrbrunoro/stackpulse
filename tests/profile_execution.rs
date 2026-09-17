@@ -12,6 +12,7 @@ fn team() -> TeamSpec {
         name: "selected-team".into(),
         provider: "openai".into(),
         orchestrator: AgentSpec {
+            provider: None,
             role: "root".into(),
             model: "gpt-6-astra".into(),
             effort: "medium".into(),
@@ -19,6 +20,7 @@ fn team() -> TeamSpec {
             when: "Sempre".into(),
         },
         agents: vec![AgentSpec {
+            provider: None,
             role: "researcher".into(),
             model: "gpt-5.6-luna".into(),
             effort: "max".into(),

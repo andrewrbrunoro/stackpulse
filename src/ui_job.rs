@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     time::{Duration, Instant},
@@ -27,6 +27,8 @@ pub(crate) struct Job {
     stdout: NamedTempFile,
     stderr: NamedTempFile,
     activity: Option<NamedTempFile>,
+    // Owned until the child has exited, including cancellation and tab switches.
+    _chat_context: Option<NamedTempFile>,
     control: Option<crate::agent_control::Mailbox>,
     export_path: Option<PathBuf>,
     started: Instant,
@@ -42,11 +44,39 @@ impl Job {
         cwd: &Path,
         export_path: Option<PathBuf>,
     ) -> Result<Self> {
-        Self::start_inner(executable, args, cwd, export_path, false)
+        Self::start_inner(executable, args, cwd, export_path, false, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn start_tracked(executable: &Path, args: &[OsString], cwd: &Path) -> Result<Self> {
-        Self::start_inner(executable, args, cwd, None, true)
+        Self::start_inner(executable, args, cwd, None, true, None)
+    }
+
+    pub(crate) fn start_chat(
+        executable: &Path,
+        args: &[OsString],
+        cwd: &Path,
+        context: &str,
+        track: bool,
+    ) -> Result<Self> {
+        let mut file =
+            NamedTempFile::new().context("Não foi possível preparar o histórico para o agente")?;
+        file.write_all(context.as_bytes())?;
+        file.flush()?;
+        let mut args = args.to_vec();
+        let separator = args
+            .len()
+            .checked_sub(2)
+            .filter(|index| args[*index] == "--")
+            .context("Pedido do chat sem separador de argumentos")?;
+        args.splice(
+            separator..separator,
+            [
+                OsString::from("--chat-context"),
+                file.path().as_os_str().to_owned(),
+            ],
+        );
+        Self::start_inner(executable, &args, cwd, None, track, Some(file))
     }
 
     fn start_inner(
@@ -55,6 +85,7 @@ impl Job {
         cwd: &Path,
         export_path: Option<PathBuf>,
         track: bool,
+        chat_context: Option<NamedTempFile>,
     ) -> Result<Self> {
         let stdout =
             NamedTempFile::new().context("Não foi possível preparar a saída do comando")?;
@@ -103,14 +134,30 @@ impl Job {
                 });
             }
         }
-        let child = command
+        if control.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command
             .spawn()
             .with_context(|| format!("Não foi possível iniciar {}", executable.display()))?;
+        if let Some(mailbox) = &control {
+            let written = child
+                .stdin
+                .take()
+                .context("Canal privado de aprovação ausente")?
+                .write_all(mailbox.approval_key());
+            if let Err(error) = written {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("Não foi possível iniciar o canal de aprovação");
+            }
+        }
         Ok(Self {
             child: Some(child),
             stdout,
             stderr,
             activity,
+            _chat_context: chat_context,
             control,
             export_path: export_path.map(|path| {
                 if path.is_absolute() {
@@ -220,6 +267,24 @@ impl Job {
         lines
     }
 
+    /// Keep the full answer in the durable transcript. Only live rendering and
+    /// diagnostics use a tail; otherwise the next turn would lose its opening.
+    pub(crate) fn transcript_lines(&self) -> Vec<String> {
+        let mut lines: Vec<_> = match fs::read(self.stdout.path()) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(sanitize)
+                .collect(),
+            Err(error) => vec![format!("Não foi possível ler a saída: {error}")],
+        };
+        lines.extend(
+            tail(self.stderr.path())
+                .into_iter()
+                .map(|line| format!("stderr: {line}")),
+        );
+        lines
+    }
+
     pub(crate) fn activity(&self) -> Option<crate::activity::ActivitySnapshot> {
         let file = File::open(self.activity.as_ref()?.path()).ok()?;
         const LIMIT: u64 = 512 * 1024;
@@ -285,6 +350,31 @@ impl Job {
             .as_ref()
             .map(|m| m.receipts())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn pending_approvals(&self) -> Vec<crate::agent_control::ApprovalRequest> {
+        if self.child.is_none() || self.cancelling() {
+            return Vec::new();
+        }
+        self.control
+            .as_ref()
+            .map(|m| m.approvals())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn decide_approval(
+        &self,
+        request: &crate::agent_control::ApprovalRequest,
+        approved: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.child.is_some() && !self.cancelling(),
+            "Esta execução está encerrada ou sendo cancelada."
+        );
+        self.control
+            .as_ref()
+            .context("Esta execução não possui canal de aprovação")?
+            .decide_approval(request, approved)
     }
 
     fn force_stop(&mut self) {

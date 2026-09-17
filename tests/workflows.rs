@@ -17,6 +17,7 @@ fn team() -> TeamSpec {
         name: "team".into(),
         provider: "openai".into(),
         orchestrator: AgentSpec {
+            provider: None,
             role: "root".into(),
             model: "gpt-6-astra".into(),
             effort: "medium".into(),
@@ -24,6 +25,7 @@ fn team() -> TeamSpec {
             when: "always".into(),
         },
         agents: vec![AgentSpec {
+            provider: None,
             role: "worker".into(),
             model: "gpt-5.6-luna".into(),
             effort: "max".into(),
@@ -531,4 +533,57 @@ fn each_cli_runs_and_feeds_the_widget_once_with_original_session_provenance() {
         );
         assert!(!tmp.path().join("should-not-exist").exists());
     }
+}
+
+#[test]
+fn refreshing_root_logs_never_claims_complete_coverage_for_mixed_providers() {
+    use ai_token_timeline::model::{Dataset, Session, Turn, Usage};
+    let temp = tempfile::tempdir().unwrap();
+    let mut db = Db::open(&temp.path().join("usage.sqlite")).unwrap();
+    let mut job = execution("mixed-coverage", 0, None);
+    job.root_id = Some("observed-root".into());
+    db.ingest(&Dataset {
+        sessions: vec![Session {
+            id: "observed-root".into(),
+            parent_id: None,
+            name: "Root only".into(),
+            project: job.project.clone(),
+            provider: "openai".into(),
+            created_at: time(),
+            source: "fixture".into(),
+        }],
+        turns: vec![Turn {
+            id: "observed-turn".into(),
+            session_id: "observed-root".into(),
+            started_at: time(),
+            ended_at: Some(time() + Duration::seconds(1)),
+            status: "completed".into(),
+            ttft_ms: Some(1),
+        }],
+        usage: vec![Usage {
+            id: "observed-usage".into(),
+            session_id: "observed-root".into(),
+            turn_id: Some("observed-turn".into()),
+            at: time() + Duration::seconds(1),
+            model: "gpt-6-astra".into(),
+            effort: "medium".into(),
+            service_tier: "default".into(),
+            tokens: Tokens {
+                input_tokens: 100,
+                output_tokens: 20,
+                ..Default::default()
+            },
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    workflow::refresh(&mut db, &mut job).unwrap();
+    assert_eq!(job.coverage, "local_observed");
+    assert_eq!(job.metrics.as_ref().unwrap().total_tokens, 120);
+    job.planned_stack.agents[0].provider = Some("xai".into());
+    workflow::refresh(&mut db, &mut job).unwrap();
+    assert_eq!(job.coverage, "multi_provider_partial");
+    assert_eq!(job.metrics.as_ref().unwrap().total_tokens, 120);
+    let saved = workflow::resolve_execution(&db, &job.id).unwrap();
+    assert_eq!(saved.coverage, "multi_provider_partial");
 }

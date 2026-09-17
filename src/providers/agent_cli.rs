@@ -24,7 +24,9 @@ pub fn configure_with_input(
     prepared_input: Option<&Path>,
 ) -> Result<()> {
     ensure!(
-        matches!(request.sandbox, "read-only" | "workspace-write"),
+        matches!(request.sandbox, "read-only" | "workspace-write")
+            || (request.settings.client == Backend::Grok
+                && request.sandbox == "danger-full-access"),
         "Modo de execução não suportado: {}",
         request.sandbox
     );
@@ -130,6 +132,11 @@ pub fn configure_with_input(
                     "--no-subagents",
                     "--disable-web-search",
                 ]);
+            } else if request.sandbox == "danger-full-access" {
+                command.args(["--permission-mode", "bypassPermissions", "--sandbox", "off"]);
+                if !request.delegates {
+                    command.arg("--no-subagents");
+                }
             } else {
                 // Approve only edits in the explicitly selected workspace; shell
                 // commands continue through the CLI's normal permission policy.

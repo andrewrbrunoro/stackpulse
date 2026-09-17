@@ -65,6 +65,7 @@ impl crossterm::Command for EnableClickMouseCapture {
 
 pub(crate) struct TerminalGuard {
     mouse: bool,
+    keyboard_enhanced: bool,
 }
 impl TerminalGuard {
     pub(crate) fn enter() -> Result<Self> {
@@ -78,10 +79,16 @@ impl TerminalGuard {
     /// Keep this guard's original raw-mode snapshot and screen ownership while
     /// reasserting input reporting after a background command has finished.
     pub(crate) fn refresh_input(&self) -> Result<()> {
-        execute!(io::stdout(), event::EnableBracketedPaste)?;
-        if self.mouse {
-            execute!(io::stdout(), EnableClickMouseCapture)?;
-        }
+        refresh_input(&mut io::stdout(), self.mouse, self.keyboard_enhanced)?;
+        Ok(())
+    }
+
+    pub(crate) fn set_mouse_capture(&mut self, enabled: bool) -> Result<()> {
+        // Own cleanup before enabling: a partially failed write may already
+        // have turned capture on. Failed disabling also keeps cleanup armed.
+        self.mouse |= enabled;
+        set_mouse_capture(&mut io::stdout(), enabled)?;
+        self.mouse = enabled;
         Ok(())
     }
 
@@ -90,7 +97,10 @@ impl TerminalGuard {
         terminal::enable_raw_mode()?;
         // Own cleanup before writing any mode sequences: partially failed entry
         // must restore raw mode, screen state, and an opted-in mouse capture.
-        let guard = Self { mouse };
+        let mut guard = Self {
+            mouse,
+            keyboard_enhanced: false,
+        };
         execute!(
             io::stdout(),
             terminal::EnterAlternateScreen,
@@ -98,17 +108,56 @@ impl TerminalGuard {
             terminal::DisableLineWrap,
             event::EnableBracketedPaste
         )?;
-        if mouse {
-            execute!(io::stdout(), EnableClickMouseCapture)?;
+        #[cfg(unix)]
+        {
+            // Unsupported terminals ignore this request. Legacy Windows input
+            // already reports modifiers and does not support this command.
+            guard.keyboard_enhanced = true;
+            execute!(
+                io::stdout(),
+                event::PushKeyboardEnhancementFlags(
+                    event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            )?;
         }
+        set_mouse_capture(&mut io::stdout(), mouse)?;
         Ok(guard)
     }
 }
 
-fn restore_terminal(output: &mut impl Write, mouse: bool) -> io::Result<()> {
+fn set_mouse_capture(output: &mut impl Write, enabled: bool) -> io::Result<()> {
+    if enabled {
+        execute!(output, EnableClickMouseCapture)
+    } else {
+        execute!(output, event::DisableMouseCapture)
+    }
+}
+
+fn refresh_input(output: &mut impl Write, mouse: bool, keyboard_enhanced: bool) -> io::Result<()> {
+    execute!(output, event::EnableBracketedPaste)?;
+    if keyboard_enhanced {
+        // Set the current kitty flags; pushing here would leak one stack entry
+        // each time a background request finishes. The guard owns one push/pop.
+        output.write_all(b"\x1b[=1u")?;
+    }
+    set_mouse_capture(output, mouse)
+}
+
+fn restore_terminal(
+    output: &mut impl Write,
+    mouse: bool,
+    keyboard_enhanced: bool,
+) -> io::Result<()> {
     // Try mouse restoration independently, even if a later screen write fails.
     let mouse_result = if mouse {
         execute!(output, event::DisableMouseCapture)
+    } else {
+        Ok(())
+    };
+    // Restore the keyboard stack before leaving its alternate screen. Keep
+    // screen cleanup independent if this write fails.
+    let keyboard_result = if keyboard_enhanced {
+        output.write_all(b"\x1b[<1u")
     } else {
         Ok(())
     };
@@ -127,13 +176,13 @@ fn restore_terminal(output: &mut impl Write, mouse: bool) -> io::Result<()> {
         // resumes another terminal UI. Raw-mode restoration still runs in Drop.
         let _ = execute!(output, event::DisableMouseCapture);
     }
-    mouse_result.and(screen_result)
+    mouse_result.and(keyboard_result).and(screen_result)
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         invalidate_draw_cache();
-        let _ = restore_terminal(&mut io::stdout(), self.mouse);
+        let _ = restore_terminal(&mut io::stdout(), self.mouse, self.keyboard_enhanced);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -650,12 +699,12 @@ mod tests {
         assert!(!enabled.contains("\x1b[?1002h"));
         assert!(!enabled.contains("\x1b[?1003h"));
         let mut disabled = Vec::new();
-        restore_terminal(&mut disabled, true).unwrap();
+        restore_terminal(&mut disabled, true, false).unwrap();
         assert!(contains(&disabled, b"\x1b[?1000l"));
         assert!(contains(&disabled, b"\x1b[?1006l"));
         assert!(contains(&disabled, b"\x1b[?1049l"));
         let mut plain = Vec::new();
-        restore_terminal(&mut plain, false).unwrap();
+        restore_terminal(&mut plain, false, false).unwrap();
         assert!(!contains(&plain, b"?1000"));
         assert!(!contains(&plain, b"?1006"));
     }
@@ -684,10 +733,31 @@ mod tests {
             failed: false,
             bytes: Vec::new(),
         };
-        assert!(restore_terminal(&mut output, true).is_err());
+        assert!(restore_terminal(&mut output, true, false).is_err());
         assert!(contains(&output.bytes, b"\x1b[?1049l"));
         assert!(contains(&output.bytes, b"\x1b[?1000l"));
         assert!(contains(&output.bytes, b"\x1b[?1006l"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn input_refresh_preserves_native_selection_and_does_not_grow_keyboard_stack() {
+        let mut output = Vec::new();
+        refresh_input(&mut output, false, true).unwrap();
+        refresh_input(&mut output, false, true).unwrap();
+        assert!(contains(&output, b"\x1b[?1000l"));
+        assert!(!contains(&output, b"\x1b[?1000h"));
+        assert!(contains(&output, b"\x1b[=1u"));
+        assert!(!contains(&output, b"\x1b[>"));
+        assert!(!contains(&output, b"\x1b[<"));
+        output.clear();
+        refresh_input(&mut output, true, true).unwrap();
+        assert!(contains(&output, b"\x1b[?1000h"));
+        output.clear();
+        restore_terminal(&mut output, false, true).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text.matches("\x1b[<1u").count(), 1);
+        assert!(text.find("\x1b[<1u").unwrap() < text.find("\x1b[?1049l").unwrap());
     }
 
     fn clear_bytes(kind: ClearType) -> Vec<u8> {

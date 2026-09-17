@@ -10,6 +10,20 @@ stackpulse ui
 stackpulse ui run
 ```
 
+Para iniciar o chat Codex/Grok sem sandbox e sem pedidos de aprovação:
+
+```sh
+stackpulse --no-policy
+# Aliases equivalentes:
+stackpulse --skip-dangerous
+stackpulse --dangerously-skip-permissions
+# Também aceita uma chamada explícita:
+stackpulse --no-policy ui
+stackpulse --no-policy run "Implemente a alteração"
+```
+
+`--no-policy` vale para os pedidos do chat e `run` nesta execução, incluindo os filhos da ponte multiprovedor. Codex recebe `danger-full-access` e aprovação `never`; Grok recebe `bypassPermissions` e sandbox `off`. Claude/Cursor ainda rejeitam esse modo. A opção não é salva, não remove políticas administradas ou permissões do sistema e não modifica sessões já abertas. Sem ela, permanece o comportamento padrão, com aprovação `on-request` no chat Codex. A autorização inicial da pasta continua necessária.
+
 A interface usa a mesma configuração, banco, fuso e diretório do projeto que os comandos existentes. Para escolher outro ambiente:
 
 ```sh
@@ -80,11 +94,13 @@ Ao enviar um pedido, as regras do perfil são aplicadas automaticamente. Não é
 
 O Codex recebe arquivos temporários com as configurações nativas dos papéis. O Claude recebe a equipe por `--agents`, com modelo e esforço por papel. Essas configurações valem para a execução e não alteram arquivos salvos dos CLIs. A concorrência no Claude é uma instrução ao orquestrador, sem imposição nativa pelo adaptador. Equipes Claude com subagentes exigem `workspace-write`; usar `read-only` em `/options` faz a execução ser recusada, sem ampliar as permissões.
 
-Perfis com subagentes usando Cursor ou Grok aparecem com **Revisão necessária** e são recusados antes de iniciar o CLI. Esses adaptadores ainda não garantem modelo/esforço por papel; no Grok, a configuração local pode substituir os valores do perfil. A orientação é usar Codex/Claude ou um perfil sem subagentes. Esse aviso descreve o suporte à equipe, não a instalação ou assinatura dos CLIs.
+Perfis com subagentes usando Cursor ou Grok como **orquestrador** aparecem com **Revisão necessária** e são recusados antes de iniciar o CLI. Esses adaptadores ainda não garantem modelo/esforço por papel; no Grok, a configuração local pode substituir os valores do perfil. A orientação é usar Codex/Claude como orquestrador ou um perfil sem subagentes. Essa restrição não impede filhos Grok em equipes multiprovedor, executados pela ponte MCP `stackpulse_team` sob um orquestrador Codex ou Claude. Esse aviso descreve o suporte à equipe, não a instalação ou assinatura dos CLIs.
 
-`Enter` envia o pedido. `Alt+Enter` ou `Shift+Enter` insere uma nova linha quando o terminal informa a combinação separadamente. A colagem preserva Unicode, quebras de linha e tabulações. O pedido aceita até **64 KiB**; se uma colagem ultrapassar o limite, ela é recusada por inteiro e o texto anterior permanece no campo. `Ctrl+U` limpa o pedido. Com o campo vazio, ↑ recupera o pedido anterior para edição; ↑/↓ percorrem os pedidos da sessão. `PgUp` e `PgDn` percorrem a conversa.
+`Enter` envia o pedido. `Alt+Enter` ou `Shift+Enter` insere uma nova linha quando o terminal informa a combinação separadamente. A interface solicita o protocolo de teclado aprimorado para preservar os modificadores. Se o terminal ainda enviar essas combinações como `Enter`, use `Ctrl+J` para inserir uma nova linha. A colagem preserva Unicode, quebras de linha e tabulações. O pedido aceita até **64 KiB**; se uma colagem ultrapassar o limite, ela é recusada por inteiro e o texto anterior permanece no campo. `Ctrl+U` limpa o pedido. Com o campo vazio, ↑ recupera o pedido anterior para edição; ↑/↓ percorrem os pedidos da sessão. `PgUp` e `PgDn` percorrem a conversa.
 
-Cada envio inicia **uma execução independente**, usando o projeto e o perfil selecionados. O conteúdo anterior da conversa não é enviado automaticamente como contexto ao provider. Inclua no pedido as informações de que o executor precisa. O histórico de texto é salvo localmente em `.stackpulse/sessions/<id>.jsonl`, dentro da pasta autorizada, separado do SQLite de consumo e feedback. São preservados os pedidos e as respostas exibidas pelo chat, sujeitos aos limites de saída da interface. Use `/sessions` para reabrir uma conversa da pasta atual, inclusive após reiniciar o aplicativo. Conversas antigas que existiam apenas em memória não podem ser recuperadas.
+Cada envio inclui **o histórico textual da sessão ativa** como contexto, junto do pedido atual, usando o projeto e o perfil selecionados. Isso mantém a continuidade ao trocar de perfil, usar `/clear` ou reabrir a conversa com `/sessions`, inclusive após reiniciar o aplicativo. `/new` começa uma conversa sem o histórico das outras abas. Cada pedido inicia uma execução do CLI; não retoma sua sessão nativa nem restaura estados internos de ferramentas.
+
+O histórico de texto é salvo localmente em `.stackpulse/sessions/<id>.jsonl`, dentro da pasta autorizada, separado do SQLite de consumo e feedback. O agente recebe os pedidos, as respostas e os estados registrados da conversa. Novas prévias ficam fora do contexto dos próximos pedidos, pois não são respostas do agente. Prévias antigas registradas apenas como “Concluído” não podem ser distinguidas automaticamente de respostas. As novas respostas são preservadas por inteiro ao finalizar; trechos omitidos por versões anteriores não podem ser recuperados automaticamente. Conversas antigas que existiam apenas em memória não podem ser recuperadas. O contexto enviado continua sujeito à capacidade do modelo escolhido e ao limite de 1 MB da entrada do executor, incluindo as instruções do perfil. Se exceder esse limite, o envio informa o erro e preserva o histórico; use `/new` para começar outra conversa.
 
 Enquanto o pedido está em execução, o chat mostra o estado e o tempo decorrido. A resposta aparece quando o CLI retorna. Tokens e custo aparecem quando são informados pelos registros ou pelo cliente. Uma métrica ausente permanece indisponível.
 
@@ -98,6 +114,7 @@ As abas ocupam duas linhas abaixo dos widgets: rótulo e sublinhado. A ativa usa
 
 | Ação | Teclado ou mouse |
 | --- | --- |
+| Copiar texto pela seleção do terminal | `F8`, selecionar e usar o atalho de cópia; `F8` ou `Esc` para voltar |
 | Nova conversa | `Ctrl+N`, `/new` ou **[+ Nova]** |
 | Editar título da conversa | **[Título]** (ou **[T]** em terminal estreito), `F2` no chat ou `/title` |
 | Selecionar pela posição visível | `Alt+1` a `Alt+9`, na ordem das conversas |
@@ -114,9 +131,9 @@ As conversas ficam ordenadas da mais recente para a mais antiga, da esquerda par
 
 ![Edição do título de uma conversa](assets/terminal-tab-title-editor.png)
 
-O mouse funciona no chat e em suas telas internas: abas, configurações, seleção de perfil, lista de conversas, formulários, campo de pedido, **Enviar**, **Cancelar** e cartões dos agentes. Clique no campo para posicionar o cursor; use a roda para percorrer a área sob o ponteiro, incluindo listas, conversa e agentes. O teclado continua disponível. Se o seu terminal permitir, `Shift` ao arrastar mantém a seleção de texto do próprio terminal para copiar.
+O mouse funciona no chat e em suas telas internas: abas, configurações, seleção de perfil, lista de conversas, formulários, campo de pedido, **Enviar**, **Cancelar** e cartões dos agentes. Clique no campo para posicionar o cursor; use a roda para percorrer a área sob o ponteiro, incluindo listas, conversa e agentes. O teclado continua disponível. Para copiar, pressione `F8`: a captura do mouse é desativada e a tela fica congelada para permitir a seleção nativa. Arraste sobre o texto e use o atalho de cópia do terminal (`Cmd+C` no macOS ou `Ctrl+Shift+C` em muitos terminais Linux/Windows). `F8` ou `Esc` encerra o modo de cópia e atualiza a tela. As execuções continuam em segundo plano durante a seleção. Se o seu terminal permitir, `Shift` ao arrastar também seleciona texto sem entrar nesse modo.
 
-A captura do mouse é ativada automaticamente nessas telas e desativada ao sair ou navegar para telas externas. O painel administrativo, o setup e o widget continuam com seus controles de teclado. Para abrir essas telas, aguarde ou cancele os pedidos de **todas as abas**; assim, a navegação não suspende o acompanhamento de trabalhos em segundo plano.
+Fora do modo de cópia, a captura do mouse é ativada automaticamente nessas telas e desativada ao sair ou navegar para telas externas. O painel administrativo, o setup e o widget continuam com seus controles de teclado. Para abrir essas telas, aguarde ou cancele os pedidos de **todas as abas**; assim, a navegação não suspende o acompanhamento de trabalhos em segundo plano.
 
 ## Configurações da conversa
 
@@ -189,13 +206,15 @@ Os detalhes mostram a atividade pública do agente e um campo de orientação, c
 | --- | --- |
 | Enviar orientação | `Enter`, `F5` ou **Enviar orientação** |
 | Interromper a tarefa do alvo e orientar novamente | `F9` ou **Interromper e redirecionar** |
-| Inserir nova linha | `Alt+Enter` ou `Shift+Enter` |
+| Inserir nova linha | `Alt+Enter`, `Shift+Enter` ou `Ctrl+J` |
 | Percorrer a atividade e as intervenções | `PgUp` / `PgDn` ou roda do mouse |
 | Voltar sem cancelar o pedido | `Esc` ou **Voltar à equipe** |
 
 Enviar e redirecionar são ações separadas. Digitar ou fechar os detalhes não executa nenhuma delas. Em terminais com menos de 110 colunas ou 28 linhas, os detalhes ocupam o corpo do chat; o compositor principal fica oculto e seu rascunho é preservado. Ao voltar, ele reaparece com o texto anterior.
 
 As execuções Codex da UI usam um **app-server privado por pedido**, preservando o login e as permissões da execução. Toda orientação é enviada ao **orquestrador**, que faz o repasse ao subagente escolhido; o StackPulse não injeta entrada diretamente nas sessões dos filhos. **Orquestrador notificado** e **Aguardando repasse** indicam apenas que o orquestrador aceitou a solicitação.
+
+No chat Codex, cada pedido inicia com política de aprovação `on-request`, mantendo o sandbox escolhido em `/options`. Quando o runtime precisar de autorização, o chat mostra a ação, o motivo e os detalhes: **Ctrl+Y** aprova e **Ctrl+N** nega. ↑/↓ e PageUp/PageDown percorrem detalhes longos. Confirmações simples de ferramentas MCP (`mcpServer/elicitation/request`, formulário sem campos) também aparecem nessa tela, com servidor, mensagem e detalhes completos. Ctrl+Y autoriza somente aquela chamada, sem salvar autorização permanente; formulários com campos e fluxos por URL não são respondidos por esse painel. A aprovação vale para aquela ação; pedidos de permissões adicionais valem somente pelo turno indicado. Fechar ou interromper a execução não concede autorização. Outros adaptadores e comandos sem chat mantêm suas políticas próprias. A mudança exige uma nova execução do StackPulse atualizado; não altera sessões já iniciadas.
 
 **Repasse confirmado** exige um evento nativo correlacionado à chamada, ao agente de destino e ao texto integral da orientação. **Redirecionamento confirmado** exige a confirmação da interrupção e do novo repasse. Uma afirmação textual do orquestrador não substitui esses eventos, e confirmar o repasse não comprova a conclusão do trabalho. Sem confirmação suficiente, a interface informa **Sem confirmação** e não reenvia automaticamente.
 
@@ -210,6 +229,7 @@ Digite `/` para ver sugestões. Use ↑/↓ para selecionar e `Tab` para complet
 | `/settings` | Abrir a aba fixa de Configurações |
 | `/profile` ou `/profiles` | Voltar à seleção e trocar a equipe |
 | `/options` | Ajustar benchmark, permissões, limite em segundos e modo de prévia dos próximos pedidos |
+| `/skip-dangerous [on\|off]` | Sem argumento ou com `on`, ativar o modo sem sandbox/aprovações para os próximos pedidos Codex/Grok em todas as abas; `off` restaura as permissões configuradas. Aliases: `/no-policy` e `/dangerously-skip-permissions`. Não altera execuções iniciadas nem persiste ao fechar o aplicativo |
 | `/agents` | Ampliar ou recolher o painel de subagentes observados na última execução |
 | `/team` | Mostrar a configuração completa da equipe do perfil ativo, sem executar agentes |
 | `/feedback` | Registrar ou editar entrega, rapidez e nota do pedido selecionado e concluído |
@@ -223,6 +243,7 @@ Digite `/` para ver sugestões. Use ↑/↓ para selecionar e `Tab` para complet
 | `/trend` | Abrir as tendências de entrega e rapidez |
 | `/report` | Abrir o relatório de tokens, tempo e custo |
 | `/setup` | Abrir a configuração do auxiliar e a seleção dos pacotes opcionais |
+| `/update` | Recompilar os fontes locais e atualizar o StackPulse instalado; reabra o aplicativo ao concluir |
 | `/menu` | Abrir o painel administrativo com todos os comandos |
 | `/widget` | Abrir as opções do widget compacto |
 | `/preview seu pedido` | Mostrar o pedido montado sem executar o provider |
@@ -236,6 +257,8 @@ Digite `/` para ver sugestões. Use ↑/↓ para selecionar e `Tab` para complet
 Em `/options` e `/feedback`, `Tab` ou `Enter` avança entre os campos; `Shift+Tab` volta. `F5` salva, ou avance até a ação de salvar e pressione `Enter`. `Esc` fecha o formulário. Entrega varia de 0 a 1, rapidez de 1 a 5; a observação em texto é opcional. O feedback fica vinculado ao ID da execução selecionada, junto do consumo e da duração. Para avaliar uma execução de outra sessão, use `/history`.
 
 Uma prévia não cria uma execução para avaliar. O comando `/preview` precisa de um perfil Markdown válido; se houver apenas uma imagem, compile-a pelo gerenciamento de perfis antes de pedir a prévia.
+
+Respostas com blocos Mermaid completos são detectadas ao término do pedido e abrem automaticamente no navegador, com Markdown e diagramas renderizados. Não é necessário digitar um comando. O texto permanece no terminal; o caminho do HTML aparece no final da conversa. A visualização requer internet para carregar as bibliotecas. Reabrir o histórico não abre o navegador novamente.
 
 ## Selecionar os pacotes opcionais
 

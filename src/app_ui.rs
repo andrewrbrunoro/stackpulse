@@ -28,6 +28,7 @@ use std::{
 use unicode_width::UnicodeWidthChar;
 
 pub struct Options {
+    pub no_policy: bool,
     /// Canonical working directory approved at application startup.
     pub cwd: PathBuf,
     pub db: PathBuf,
@@ -175,6 +176,9 @@ impl App {
             path_option("sessions", &self.options.sessions),
             format!("--timezone={}", self.options.timezone).into(),
         ];
+        if self.options.no_policy {
+            args.push("--no-policy".into());
+        }
         args.extend(invocation.args.iter().cloned());
         args
     }
@@ -986,6 +990,7 @@ mod tests {
 
     fn app(db: &Db, dir: &Path, page: Page) -> App {
         let options = Options {
+            no_policy: false,
             cwd: dir.into(),
             db: dir.join("usage.sqlite"),
             config: dir.join("missing.json"),

@@ -233,15 +233,22 @@ pub(crate) fn load(
                                 details.extend(team_lines(&profile.team));
                                 match profiles::check_image(&profile, &found.path) {
                                     Ok(()) => {
-                                        let incomplete = profile.team.provider == "unknown"
-                                            || std::iter::once(&profile.team.orchestrator)
+                                        let incomplete =
+                                            std::iter::once(&profile.team.orchestrator)
                                                 .chain(&profile.team.agents)
                                                 .any(|a| {
-                                                    a.model == "unknown" || a.effort == "unknown"
+                                                    profile.team.provider_for(a) == "unknown"
+                                                        || a.model == "unknown"
+                                                        || a.effort == "unknown"
                                                 });
                                         if incomplete {
                                             details.push("Preencha os campos unknown no Markdown antes de executar.".into());
                                             "campos a completar"
+                                        } else if let Err(error) =
+                                            profile.team.validate_execution_providers()
+                                        {
+                                            details.push(error.to_string());
+                                            "revisão necessária"
                                         } else {
                                             "pronto"
                                         }
@@ -520,7 +527,7 @@ pub(crate) fn load(
                                 .join(", ")
                         ));
                         view.lines.push(
-                            "O cliente de execução é escolhido pelo provider da equipe.".into(),
+                            "O cliente do root usa seu provider; papéis com outro provider usam a ponte StackPulse.".into(),
                         );
                         view.lines.push(
                             "Uma imagem ainda sem Markdown será compilada ao executar.".into(),
@@ -732,6 +739,7 @@ fn coverage(value: &str) -> &str {
         "local_observed" => "árvore observada nos logs locais",
         "local_partial" => "logs locais parciais",
         "root_only" => "somente agente principal",
+        "multi_provider_partial" => "parcial: métricas dos outros providers não consolidadas",
         "cli_tree" => "total da árvore informado pelo CLI",
         "cli_partial" => "parcial informado pelo CLI",
         "unavailable" => "não informada",
@@ -741,14 +749,21 @@ fn coverage(value: &str) -> &str {
 
 fn team_lines(team: &TeamSpec) -> Vec<String> {
     let mut lines = vec![
-        format!("Equipe: {} · provider {}", team.name, team.provider),
+        format!(
+            "Equipe: {} · provider do root {}",
+            team.name,
+            team.root_provider()
+        ),
         format!("Delegação: {}", team.delegation),
         "STACK PLANEJADA".into(),
     ];
     for agent in std::iter::once(&team.orchestrator).chain(&team.agents) {
         lines.push(format!(
-            "{} → {} · {}",
-            agent.role, agent.model, agent.effort
+            "{} → {} · {} · provider {}",
+            agent.role,
+            agent.model,
+            agent.effort,
+            team.provider_for(agent)
         ));
         lines.push(format!("  {}", agent.purpose));
         if !agent.when.is_empty() {

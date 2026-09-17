@@ -75,7 +75,9 @@ for line in sys.stdin:
         assert "STACKPULSE_ACTIVITY_FILE" not in os.environ
         reply(request, {"userAgent": "stackpulse-offline-fixture"})
     elif method == "thread/start":
-        assert params["approvalPolicy"] == "never"
+        assert params["approvalPolicy"] == ("never" if mode == "no_policy" else "on-request")
+        assert params["sandbox"] == ("danger-full-access" if mode == "no_policy" else "workspace-write")
+        assert params["approvalsReviewer"] == "user"
         reply(request, {"thread": {"id": ROOT, "parentThreadId": None}, "model": "gpt-6-astra", "reasoningEffort": "medium"})
         if mode == "blocked_stdin":
             time.sleep(10)
@@ -91,6 +93,10 @@ for line in sys.stdin:
             event("thread/tokenUsage/updated", {"threadId": ROOT, "turnId": TURN, "tokenUsage": {"total": {"inputTokens": total, "cachedInputTokens": 10, "outputTokens": 20, "reasoningOutputTokens": 5}}})
         # Must never be surfaced by StackPulse observers or included in final output.
         event("rawResponseItem/completed", {"threadId": ROOT, "item": {"type": "reasoning", "content": ["PRIVATE_FIXTURE_REASONING"]}})
+        if mode.startswith("approval_mcp_"):
+            emit({"id": "approval-mcp", "method": "mcpServer/elicitation/request", "params": {"threadId": ROOT, "turnId": TURN, "serverName": "stackpulse_team", "mode": "form", "message": "Permitir execução da ferramenta spawn?", "requestedSchema": {"type": "object", "properties": {}}, "_meta": {"codex_approval_kind": "mcp_tool_call", "persist": ["session", "always"]}}})
+        elif mode.startswith("approval_"):
+            emit({"id": "approval-command", "method": "item/commandExecution/requestApproval", "params": {"threadId": ROOT, "turnId": TURN, "itemId": "git-command", "command": "git add example.txt", "cwd": str(Path.cwd()), "reason": "Gravar no índice Git"}})
         threading.Thread(target=delayed_complete, daemon=True).start()
     elif method == "turn/steer":
         assert params["threadId"] == ROOT
@@ -109,5 +115,14 @@ for line in sys.stdin:
                 event("item/started", {"threadId": CHILD, "item": {"type": "commandExecution", "id": "command-2", "command": "cargo test validation --lib", "status": "inProgress"}})
         if config.get("finish_after_control"):
             complete()
+    elif request.get("id") == "approval-command" and method is None:
+        assert request["result"]["decision"] == ("accept" if mode == "approval_accept" else "decline")
+        event("fixture/approvalReceived", {})
+        complete()
+    elif request.get("id") == "approval-mcp" and method is None:
+        accepted = mode == "approval_mcp_accept"
+        assert request["result"] == {"action": "accept" if accepted else "decline", "content": {} if accepted else None}
+        event("fixture/approvalReceived", {})
+        complete()
     elif method == "initialized":
         pass

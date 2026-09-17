@@ -303,6 +303,7 @@ fn write_profile(directory: &Path) {
             name: "team".into(),
             provider: "openai".into(),
             orchestrator: AgentSpec {
+                provider: None,
                 role: "root".into(),
                 model: "test-model".into(),
                 effort: "medium".into(),

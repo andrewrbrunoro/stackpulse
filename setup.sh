@@ -20,7 +20,7 @@ Uso: ./setup.sh [opções]
 
 Requer Cargo/Rust. A versão do Rust é definida em rust-toolchain.toml.
 Compila a aplicação, instala o comando stackpulse e preserva perfis e histórico.
-Execute novamente para atualizar. Nenhum provider é chamado pelo instalador.
+Use stackpulse update ou /update no chat para atualizar. Nenhum provider é chamado pelo instalador.
 Uma única página reúne os plugins; use Espaço para marcar e Enter para continuar.
 AI-Memory vem selecionado por padrão. Flags explícitas ficam fixas na seleção.
 Sem terminal interativo, o padrão instala AI-Memory; use --without-memory para pular.
@@ -212,6 +212,10 @@ case "$STACKPULSE_PREFIX$STACKPULSE_RC" in
 esac
 
 STACKPULSE_SOURCE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+case "$STACKPULSE_SOURCE" in
+    *'
+'*|*''*) fail 'Use uma pasta de fontes sem quebras de linha.' ;;
+esac
 [ -f "$STACKPULSE_SOURCE/Cargo.toml" ] && [ -f "$STACKPULSE_SOURCE/rust-toolchain.toml" ] || fail 'Mantenha setup.sh na pasta do projeto, junto de Cargo.toml.'
 case "$STACKPULSE_PREFIX" in
     /*) ;;
@@ -318,6 +322,7 @@ STACKPULSE_MANIFEST_STAGE=$(mktemp "$STACKPULSE_SHARE/.install.XXXXXX")
 {
     printf '%s\n' 'stackpulse-installer-v1'
     cksum < "$STACKPULSE_STAGE"
+    printf '%s\n' "$STACKPULSE_SOURCE"
 } > "$STACKPULSE_MANIFEST_STAGE"
 chmod 644 "$STACKPULSE_MANIFEST_STAGE"
 # Rename avoids partial binaries and replaces symlinks without following them.

@@ -1,4 +1,4 @@
-//! Profile-first terminal for submitting independent tracked requests.
+//! Profile-first terminal for tracked requests with per-session conversation context.
 use crate::{
     activity::{ActivitySnapshot, AgentStatus},
     app_ui::{self, Options, emitted_execution_id, path_option},
@@ -39,7 +39,27 @@ use std::{
     time::{Duration, Instant},
 };
 
-const COMMANDS: [(&str, &str); 23] = [
+fn open_response_browser(path: &std::path::Path) -> std::io::Result<()> {
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer.exe"
+    } else {
+        "xdg-open"
+    };
+    let mut child = std::process::Command::new(program)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+const COMMANDS: [(&str, &str); 27] = [
     ("/title", "editar o título desta conversa"),
     (
         "/settings",
@@ -49,6 +69,15 @@ const COMMANDS: [(&str, &str); 23] = [
     ("/team", "ver todos os papéis da equipe configurada"),
     ("/profile", "trocar a equipe"),
     ("/options", "permissões, benchmark e limite"),
+    (
+        "/skip-dangerous",
+        "sem sandbox/aprovações: on ativa, off restaura",
+    ),
+    ("/no-policy", "alias de /skip-dangerous [on|off]"),
+    (
+        "/dangerously-skip-permissions",
+        "alias de /skip-dangerous [on|off]",
+    ),
     ("/feedback", "avaliar o pedido selecionado"),
     ("/usage", "tokens e avaliações de cada pedido da conversa"),
     ("/history", "execuções e consumo"),
@@ -59,6 +88,10 @@ const COMMANDS: [(&str, &str); 23] = [
     ("/trend", "curvas de entrega"),
     ("/report", "relatório de tokens e tempo"),
     ("/setup", "configurar o auxiliar"),
+    (
+        "/update",
+        "atualizar o StackPulse a partir dos fontes locais",
+    ),
     ("/menu", "todos os comandos"),
     ("/widget", "widget compacto"),
     ("/clear", "limpar a conversa da tela"),
@@ -170,10 +203,18 @@ struct AgentViewState {
 
 struct Running {
     job: Job,
+    approval_view: Option<ApprovalView>,
+    preview: bool,
     turn: usize,
     emitted: Option<String>,
     last_metrics: Instant,
     last_history: Instant,
+}
+
+struct ApprovalView {
+    request: crate::agent_control::ApprovalRequest,
+    scroll: usize,
+    visible: bool,
 }
 // A parked tab owns its complete conversation and child process. The SQLite
 // connection and its ownership token are shared by every tab in this terminal.
@@ -268,6 +309,8 @@ enum TranscriptLine {
     Text(String, Tone),
 }
 struct Chat {
+    browser_opener: fn(&std::path::Path) -> std::io::Result<()>,
+    selecting_text: bool,
     options: Options,
     cwd: PathBuf,
     executable: PathBuf,
@@ -314,6 +357,8 @@ impl Chat {
         let session = history.create_session(&cwd)?;
         let notice = history.take_warnings();
         Ok(Self {
+            browser_opener: open_response_browser,
+            selecting_text: false,
             options,
             cwd,
             executable: std::env::current_exe()?,
@@ -874,6 +919,9 @@ impl Chat {
             return;
         };
         self.swap_tab(&mut tab);
+        if let Some(view) = self.running.as_mut().and_then(|r| r.approval_view.as_mut()) {
+            view.visible = false;
+        }
         self.tabs[self.active_tab] = Some(tab);
         self.active_tab = index;
         self.unread = false;
@@ -1119,6 +1167,9 @@ impl Chat {
             path_option("sessions", &self.options.sessions),
             format!("--timezone={}", self.options.timezone).into(),
         ];
+        if self.options.no_policy {
+            args.push("--no-policy".into());
+        }
         args.extend(extra);
         args
     }
@@ -1140,6 +1191,7 @@ impl Chat {
             app_ui::run(
                 db,
                 Options {
+                    no_policy: self.options.no_policy,
                     cwd: self.cwd.clone(),
                     db: self.options.db.clone(),
                     config: self.options.config.clone(),
@@ -1149,7 +1201,9 @@ impl Chat {
                 },
             )
         };
-        *guard = Some(TerminalGuard::enter_with_mouse()?);
+        let mut terminal = TerminalGuard::enter_with_mouse()?;
+        terminal.set_mouse_capture(!self.selecting_text)?;
+        *guard = Some(terminal);
         self.refresh_execution_metrics(db, true);
         self.refresh_profiles();
         if let Some(chosen) = &self.chosen {
@@ -1181,6 +1235,29 @@ impl Chat {
         }
         Ok(())
     }
+    fn update(&mut self, guard: &mut Option<TerminalGuard>) -> Result<()> {
+        ensure!(
+            !self.any_running(),
+            "Há pedidos em execução nas abas. Aguarde ou cancele antes de atualizar o StackPulse."
+        );
+        drop(guard.take());
+        let result = app_ui::interactive(
+            &self.executable,
+            &self.arguments(vec!["update".into()]),
+            &self.cwd,
+            &self.interrupted,
+        );
+        let mut terminal = TerminalGuard::enter_with_mouse()?;
+        terminal.set_mouse_capture(!self.selecting_text)?;
+        *guard = Some(terminal);
+        let status = result.context("Não foi possível executar a atualização")?;
+        ensure!(
+            status.success(),
+            "A atualização não foi concluída ({status}). Consulte a saída no terminal."
+        );
+        self.notice = "StackPulse atualizado. Saia com /exit e abra stackpulse novamente para usar a nova versão.".into();
+        Ok(())
+    }
     fn send(&mut self, prompt: String, preview: bool) -> Result<()> {
         ensure!(
             self.running.is_none(),
@@ -1198,24 +1275,29 @@ impl Chat {
             form.fields[5].value = "sim".into();
         }
         let invocation = ui_commands::build(&form)?;
+        // build validated this boolean; prompt/benchmark strings can themselves
+        // contain flag names and must never change the execution mode.
+        let preview = form.fields[5].value.trim().eq_ignore_ascii_case("sim");
         let args = self.arguments(invocation.args);
+        // Read durable history before appending this request. /clear only hides
+        // the view, and switching profiles must retain the same conversation.
+        let context = self.history.context(&self.session.id)?;
         let status = if preview {
-            "Preparando prévia…"
+            "Prévia · preparando…"
         } else {
             "Trabalhando…"
         };
         let turn_id = self
             .history
             .start_turn(&self.session.id, &prompt, &chosen.name, status)?;
-        let started = if preview {
-            Job::start(&self.executable, &args, &self.cwd, None)
-        } else {
-            Job::start_tracked(&self.executable, &args, &self.cwd)
-        };
+        let started = Job::start_chat(&self.executable, &args, &self.cwd, &context, !preview);
         let job = match started {
             Ok(job) => job,
             Err(error) => {
-                let status = format!("Erro ao iniciar: {error:#}");
+                let status = format!(
+                    "{}Erro ao iniciar: {error:#}",
+                    if preview { "Prévia · " } else { "" }
+                );
                 self.history
                     .update_turn(&self.session.id, &turn_id, &[], &status, None, true)?;
                 return Err(error);
@@ -1244,6 +1326,8 @@ impl Chat {
         self.metrics_open = false;
         self.running = Some(Running {
             job,
+            approval_view: None,
+            preview,
             turn,
             emitted: None,
             last_metrics: Instant::now() - Duration::from_secs(2),
@@ -1271,7 +1355,8 @@ impl Chat {
         let turn = &mut self.turns[running.turn];
         turn.lines = answer_lines(&lines, running.emitted.as_deref());
         turn.status = format!(
-            "{} · {}",
+            "{}{} · {}",
+            if running.preview { "Prévia · " } else { "" },
             if running.job.cancelling() {
                 "Cancelando e salvando registro…"
             } else {
@@ -1332,7 +1417,7 @@ impl Chat {
             {
                 self.notice = format!("Atividade não pôde ser salva: {error:#}");
             }
-            let lines = running.job.lines();
+            let lines = running.job.transcript_lines();
             if running.emitted.is_none() {
                 running.emitted = emitted_execution_id(&lines);
             }
@@ -1348,6 +1433,9 @@ impl Chat {
                 Err(error) => format!("Erro: {error:#}"),
                 _ => unreachable!(),
             };
+            if running.preview {
+                turn.status = format!("Prévia · {}", turn.status);
+            }
             if turn.execution.is_some() {
                 self.notice =
                     "/feedback para avaliar entrega e rapidez · ou envie outro pedido".into();
@@ -1361,6 +1449,11 @@ impl Chat {
                 true,
             ) {
                 self.notice = format!("Execução terminou, mas o histórico falhou: {error:#}");
+            }
+            let response = turn.lines.join("\n");
+            let render = !running.preview && crate::chat_preview::has_mermaid(&response);
+            if render && let Err(error) = self.render_response(&response) {
+                self.notice = format!("Não foi possível renderizar o diagrama: {error:#}");
             }
             if let Err(error) = self.finish_agent_receipts() {
                 self.notice = format!("Falha ao finalizar intervenções: {error:#}");
@@ -1383,7 +1476,7 @@ impl Chat {
         let saved = (|| -> Result<()> {
             if let Some(running) = &mut self.running {
                 running.job.cancel();
-                let lines = running.job.lines();
+                let lines = running.job.transcript_lines();
                 if running.emitted.is_none() {
                     running.emitted = emitted_execution_id(&lines);
                 }
@@ -1393,6 +1486,9 @@ impl Chat {
                     turn.execution = execution(db, id).ok().flatten();
                 }
                 turn.status = "Interrompido · terminal encerrado".into();
+                if running.preview {
+                    turn.status = format!("Prévia · {}", turn.status);
+                }
                 turn.finished = true;
                 for agent in &mut self.activity.agents {
                     if agent.started_at.is_some() && agent.finished_at.is_none() {
@@ -1686,6 +1782,20 @@ impl Chat {
         self.stage = Stage::Chat;
         Ok(())
     }
+    fn render_response(&mut self, response: &str) -> Result<()> {
+        let path = crate::chat_preview::write_preview(response)?;
+        let status = match (self.browser_opener)(&path) {
+            Ok(()) => "Abertura automática solicitada ao navegador",
+            Err(_) => "Não foi possível abrir o navegador; abra o arquivo manualmente",
+        };
+        self.note.extend([
+            format!("{status}: {}", path.display()),
+            "Mermaid detectado · Markdown e diagramas renderizados no navegador. Requer internet para carregar as bibliotecas de renderização.".into(),
+        ]);
+        self.notice =
+            "Mermaid detectado. O caminho da visualização está no final da conversa.".into();
+        Ok(())
+    }
     fn suggestions(&self) -> Vec<(&'static str, &'static str)> {
         if !self.composer.value.starts_with('/')
             || self.composer.value.contains(char::is_whitespace)
@@ -1718,7 +1828,10 @@ impl Chat {
             _ => None,
         };
         ensure!(
-            cmd == "/preview" || args.trim().is_empty(),
+            matches!(
+                cmd,
+                "/preview" | "/skip-dangerous" | "/no-policy" | "/dangerously-skip-permissions"
+            ) || args.trim().is_empty(),
             "Esse comando não aceita argumentos."
         );
         if let Some(page) = page {
@@ -1729,6 +1842,26 @@ impl Chat {
         self.focus_note = false;
         self.metrics_open = false;
         match cmd {
+            "/skip-dangerous" | "/no-policy" | "/dangerously-skip-permissions" => {
+                let enabled = match args.trim() {
+                    "" | "on" => true,
+                    "off" => false,
+                    _ => anyhow::bail!("Use /skip-dangerous [on|off]."),
+                };
+                self.options.no_policy = enabled;
+                self.notice = if enabled {
+                    "Modo sem sandbox/aprovações ativado para os próximos pedidos Codex/Grok em todas as abas."
+                } else {
+                    "Modo sem sandbox/aprovações desativado; próximos pedidos seguem as permissões configuradas."
+                }.into();
+                self.note.push(self.notice.clone());
+                self.note.push(
+                    "Execuções já iniciadas não mudam. A opção não é salva ao fechar o aplicativo."
+                        .into(),
+                );
+                self.follow = true;
+            }
+            "/update" => self.update(guard)?,
             "/title" => self.edit_title(),
             "/import-session" => self.edit_transfer(true),
             "/export-session" => self.edit_transfer(false),
@@ -1793,10 +1926,10 @@ impl Chat {
                     .map(|(c, d)| format!("{c:<12} {d}"))
                     .collect();
                 self.note.push(
-                    "Enter envia · Alt+Enter nova linha · PgUp/PgDn histórico · Esc cancela".into(),
+                    "Enter envia · Alt+Enter / Ctrl+J nova linha · PgUp/PgDn histórico · Esc cancela".into(),
                 );
                 self.note.push("Abas: Ctrl+N nova · Alt+←/→ ou F6 alterna · Ctrl+W fecha · ● trabalhando · • conclusão não vista".into());
-                self.note.push("Clique nas abas, botões e campos; a roda percorre a conversa ou os agentes. Para selecionar texto, use Shift+arrastar se o terminal permitir.".into());
+                self.note.push("F8 seleciona texto: arraste e use Copiar do terminal; F8/Esc volta. A tela fica parada enquanto os pedidos continuam. Fora desse modo, clique e roda navegam.".into());
                 self.note.push("Cada pedido inicia uma execução independente. /sessions reabre conversas deste projeto sem reenviar seu conteúdo ao provider.".into());
                 self.follow = true;
             }
@@ -1817,6 +1950,163 @@ impl Chat {
         self.composer = Composer::default();
         Ok(false)
     }
+    /// Decisions apply only to the exact request the user has already seen.
+    fn approval_key(&mut self, key: KeyEvent) -> bool {
+        let Some(running) = &mut self.running else {
+            return false;
+        };
+        let pending = running.job.pending_approvals();
+        if pending.is_empty() {
+            running.approval_view = None;
+            return false;
+        }
+        // Keep tab navigation available while one job waits for permission.
+        if key.code == KeyCode::F(6)
+            || (key.modifiers.contains(KeyModifiers::ALT)
+                && matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char('1'..='9')
+                ))
+            || (key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Tab | KeyCode::BackTab))
+        {
+            return false;
+        }
+        let ctrl = key.modifiers == KeyModifiers::CONTROL;
+        if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
+            running.job.cancel();
+            return true;
+        }
+        let Some(view) = &mut running.approval_view else {
+            return true;
+        };
+        match key.code {
+            KeyCode::Up => view.scroll = view.scroll.saturating_sub(1),
+            KeyCode::Down => view.scroll = view.scroll.saturating_add(1),
+            KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(8),
+            KeyCode::PageDown => view.scroll = view.scroll.saturating_add(8),
+            KeyCode::Home => view.scroll = 0,
+            KeyCode::End => view.scroll = usize::MAX,
+            KeyCode::Char(c @ ('y' | 'n')) if ctrl && key.kind == KeyEventKind::Press => {
+                if view.visible
+                    && pending.iter().any(|request| {
+                        request.request_id == view.request.request_id
+                            && request.method == view.request.method
+                            && request.params == view.request.params
+                    })
+                {
+                    let request = view.request.clone();
+                    match running.job.decide_approval(&request, c == 'y') {
+                        Ok(()) => {
+                            running.approval_view = None;
+                            self.notice = if c == 'y' {
+                                "Aprovação enviada para esta solicitação."
+                            } else {
+                                "Solicitação negada."
+                            }
+                            .into();
+                        }
+                        Err(error) => self.notice = format!("{error:#}"),
+                    }
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn draw_approval(&mut self, frame: &mut Frame) -> bool {
+        let Some(running) = &mut self.running else {
+            return false;
+        };
+        let requests = running.job.pending_approvals();
+        let count = requests.len();
+        let Some(request) = requests.into_iter().next() else {
+            running.approval_view = None;
+            return false;
+        };
+        if !running.approval_view.as_ref().is_some_and(|view| {
+            view.request.request_id == request.request_id
+                && view.request.method == request.method
+                && view.request.params == request.params
+        }) {
+            running.approval_view = Some(ApprovalView {
+                request,
+                scroll: 0,
+                visible: false,
+            });
+        }
+        let view = running.approval_view.as_mut().unwrap();
+        view.visible = true;
+        let width = frame.width.saturating_sub(4);
+        let capacity = frame.height.saturating_sub(10);
+        let params = serde_json::to_string_pretty(&view.request.params).unwrap_or_default();
+        let details = format!(
+            "Solicitação: {}\nMétodo: {}\nParâmetros completos (comando, motivo, diretório, thread e alterações):\n{}",
+            view.request.request_id, view.request.method, params
+        );
+        let lines = wrap(&details, width);
+        view.scroll = view.scroll.min(lines.len().saturating_sub(capacity));
+        put(
+            frame,
+            2,
+            1,
+            "STACKPULSE · PERMISSÃO NECESSÁRIA",
+            Tone::Warning,
+            width,
+        );
+        put(
+            frame,
+            2,
+            2,
+            &format!("Conversa: {} · {count} pendente(s)", self.session.title),
+            Tone::Text,
+            width,
+        );
+        let scope = if view.request.method == "item/permissions/requestApproval" {
+            "Ctrl+Y aprovar nesta rodada · Ctrl+N negar"
+        } else {
+            "Ctrl+Y aprovar uma vez · Ctrl+N negar"
+        };
+        put(frame, 2, 4, scope, Tone::Accent, width);
+        for (offset, line) in lines.iter().skip(view.scroll).take(capacity).enumerate() {
+            put(frame, 2, 6 + offset, line, Tone::Text, width);
+        }
+        put(
+            frame,
+            2,
+            frame.height - 3,
+            &self.notice,
+            Tone::Warning,
+            width,
+        );
+        put(
+            frame,
+            2,
+            frame.height - 2,
+            &format!(
+                "↑↓/PgUp/PgDn rolar ({}/{}) · Esc cancelar",
+                view.scroll + 1,
+                lines.len()
+            ),
+            Tone::Muted,
+            width,
+        );
+        put(
+            frame,
+            2,
+            frame.height - 1,
+            if self.selecting_text {
+                "COPIAR · F8/Esc voltar antes de decidir"
+            } else {
+                "Alt+←/→ mudar aba · Enter não confirma"
+            },
+            Tone::Muted,
+            width,
+        );
+        true
+    }
+
     fn key(
         &mut self,
         key: KeyEvent,
@@ -1826,8 +2116,27 @@ impl Chat {
         if key.kind == KeyEventKind::Release {
             return Ok(false);
         }
+        if key.code == KeyCode::F(8) || (self.selecting_text && key.code == KeyCode::Esc) {
+            if key.kind == KeyEventKind::Repeat {
+                return Ok(false);
+            }
+            let selecting = !self.selecting_text;
+            if let Some(guard) = guard {
+                guard.set_mouse_capture(!selecting)?;
+            }
+            self.selecting_text = selecting;
+            return Ok(false);
+        }
+        // Native copy shortcuts must never edit or submit the draft. Leave
+        // selection mode explicitly before interacting with the application.
+        if self.selecting_text {
+            return Ok(false);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if self.approval_key(key) {
+            return Ok(false);
+        }
         let tab_action = match key.code {
             KeyCode::F(2) if matches!(self.stage, Stage::Chat) => Some(TabAction::Rename),
             KeyCode::Char('n') if ctrl => Some(TabAction::New),
@@ -1890,11 +2199,7 @@ impl Chat {
                     KeyCode::PageDown => {
                         self.agent_view.scroll = self.agent_view.scroll.saturating_add(5)
                     }
-                    KeyCode::Enter
-                        if key
-                            .modifiers
-                            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-                    {
+                    _ if is_newline(key) => {
                         let id = self.agent_view.selected.clone().unwrap();
                         self.notice = self
                             .agent_view
@@ -2088,11 +2393,9 @@ impl Chat {
                         e.error = format!("{error:#}");
                     }
                 }
-                KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-                    if editor.form.fields
-                        [editor.indices[editor.selected.min(editor.inputs.len() - 1)]]
-                    .multiline
-                        && editor.selected < editor.inputs.len()
+                _ if is_newline(key) => {
+                    if editor.selected < editor.inputs.len()
+                        && editor.form.fields[editor.indices[editor.selected]].multiline
                     {
                         editor.error = editor.inputs[editor.selected]
                             .insert("\n")
@@ -2120,11 +2423,7 @@ impl Chat {
                 }
             },
             Stage::Chat => match key.code {
-                KeyCode::Enter
-                    if key
-                        .modifiers
-                        .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
-                {
+                _ if is_newline(key) => {
                     self.notice = self.composer.insert("\n").err().unwrap_or_default();
                 }
                 KeyCode::Enter => match self.command(db, guard) {
@@ -2198,6 +2497,18 @@ impl Chat {
         db: &mut Db,
         guard: &mut Option<TerminalGuard>,
     ) -> Result<bool> {
+        if let Some(running) = &mut self.running
+            && !running.job.pending_approvals().is_empty()
+        {
+            if let Some(view) = &mut running.approval_view {
+                match event.kind {
+                    MouseEventKind::ScrollUp => view.scroll = view.scroll.saturating_sub(3),
+                    MouseEventKind::ScrollDown => view.scroll = view.scroll.saturating_add(3),
+                    _ => {}
+                }
+            }
+            return Ok(false);
+        }
         let x = usize::from(event.column);
         let y = usize::from(event.row);
         let target = self
@@ -2399,6 +2710,16 @@ impl Chat {
         Ok(false)
     }
     fn paste(&mut self, value: &str) {
+        if self
+            .running
+            .as_ref()
+            .is_some_and(|r| !r.job.pending_approvals().is_empty())
+        {
+            return;
+        }
+        if self.selecting_text {
+            return;
+        }
         if self.settings_open {
             return;
         }
@@ -2456,6 +2777,9 @@ impl Chat {
         let h = usize::from(rows);
         let mut f = Frame::blank(w, h);
         if w < 64 || h < 20 {
+            if let Some(view) = self.running.as_mut().and_then(|r| r.approval_view.as_mut()) {
+                view.visible = false;
+            }
             f.put(2, 2, "STACKPULSE", Tone::Accent);
             f.put(
                 2,
@@ -2466,9 +2790,16 @@ impl Chat {
             f.put(
                 2,
                 6,
-                "Ctrl+C sai · Esc cancela uma execução ativa",
+                if self.selecting_text {
+                    "COPIAR · F8/Esc voltar"
+                } else {
+                    "Ctrl+C sai · Esc cancela uma execução ativa"
+                },
                 Tone::Muted,
             );
+            return f;
+        }
+        if self.draw_approval(&mut f) {
             return f;
         }
         let right = w - 3;
@@ -2744,7 +3075,7 @@ impl Chat {
                     &mut f,
                     2,
                     6,
-                    "Enter reabre · o histórico serve só para exibição e não vira contexto do provider.",
+                    "Enter reabre · o histórico desta sessão acompanha os próximos pedidos ao agente.",
                     Tone::Muted,
                     right,
                 );
@@ -3465,7 +3796,7 @@ impl Chat {
                     &mut f,
                     3,
                     h - 4,
-                    " Alt+Enter: nova linha ",
+                    " Alt+Enter/Ctrl+J: linha · F8 copiar ",
                     Tone::Muted,
                     right - 17,
                 );
@@ -3533,22 +3864,44 @@ impl Chat {
                 }
                 let requests = self.turns.len();
                 let shortcuts = if has_detail {
-                    "Enter orientar · Alt+Enter linha · F9 redirecionar · Esc voltar".into()
+                    "Enter orientar · Ctrl+J linha · F8 copiar · F9 redirecionar · Esc voltar"
+                        .into()
                 } else if expanded {
                     "F4 / Esc voltar · Alt+↑↓ agentes · Ctrl+C cancelar/sair".into()
                 } else if w < 86 {
-                    "Enter enviar · F6 abas · Ctrl+N nova · Ctrl+C sair".into()
+                    "Enter enviar · Ctrl+J linha · F8 copiar · F6 abas".into()
                 } else {
                     format!(
-                        "{requests} {} · Enter enviar · Alt+Enter linha · F6 abas · Ctrl+N nova · Ctrl+W fechar · /help",
+                        "{requests} {} · Enter enviar · Ctrl+J linha · F8 copiar · F6 abas · /help",
                         if requests == 1 { "pedido" } else { "pedidos" }
                     )
                 };
                 put(&mut f, 2, h - 2, &shortcuts, Tone::Muted, right);
             }
         }
+        if self.selecting_text {
+            f.caret = None;
+            put(&mut f, 2, h - 2, &" ".repeat(w - 4), Tone::Muted, w - 4);
+            put(
+                &mut f,
+                2,
+                h - 2,
+                "COPIAR: arraste e use Copiar do terminal · F8/Esc voltar",
+                Tone::Warning,
+                w - 4,
+            );
+        }
         f
     }
+}
+
+fn is_newline(key: KeyEvent) -> bool {
+    (key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT))
+        || (matches!(key.code, KeyCode::Char('j' | 'J'))
+            && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
 fn execution(db: &Db, id: &str) -> Result<Option<Execution>> {
@@ -3728,6 +4081,7 @@ pub fn run(db: &mut Db, options: Options) -> Result<()> {
     }
     let mut guard = Some(TerminalGuard::enter_with_mouse()?);
     let result = (|| -> Result<()> {
+        let mut selection_frame_size = None;
         loop {
             if chat.interrupted.load(Ordering::Relaxed) {
                 break;
@@ -3738,7 +4092,12 @@ pub fn run(db: &mut Db, options: Options) -> Result<()> {
                 guard.refresh_input()?;
             }
             let (w, h) = terminal::size()?;
-            chat.frame(w, h).draw(w, h, tui::colors())?;
+            // Poll jobs normally, but avoid destroying native selections with
+            // redraws. Resize and entering/leaving selection still redraw once.
+            if !chat.selecting_text || selection_frame_size != Some((w, h)) {
+                chat.frame(w, h).draw(w, h, tui::colors())?;
+                selection_frame_size = chat.selecting_text.then_some((w, h));
+            }
             if !event::poll(Duration::from_millis(if chat.any_running() {
                 150
             } else {
@@ -3750,6 +4109,7 @@ pub fn run(db: &mut Db, options: Options) -> Result<()> {
                 Event::Key(key) => {
                     if (w < 64 || h < 20)
                         && key.code != KeyCode::Esc
+                        && key.code != KeyCode::F(8)
                         && !(key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL))
                     {
@@ -3760,7 +4120,7 @@ pub fn run(db: &mut Db, options: Options) -> Result<()> {
                     }
                 }
                 Event::Paste(value) if w >= 64 && h >= 20 => chat.paste(&value),
-                Event::Mouse(event) if w >= 64 && h >= 20 => {
+                Event::Mouse(event) if w >= 64 && h >= 20 && !chat.selecting_text => {
                     match chat.mouse(event, db, &mut guard) {
                         Ok(true) => break,
                         Ok(false) => {}
@@ -3807,6 +4167,7 @@ mod tests {
         .save(&config)
         .unwrap();
         let options = Options {
+            no_policy: false,
             cwd: dir.into(),
             db: dir.join("usage.sqlite"),
             config,
@@ -3815,8 +4176,109 @@ mod tests {
             page: Page::Run,
         };
         let db = Db::open(&options.db).unwrap();
-        (Chat::new(options, dir.into()).unwrap(), db)
+        let mut chat = Chat::new(options, dir.into()).unwrap();
+        chat.browser_opener = |_| Ok(());
+        (chat, db)
     }
+    #[test]
+    fn skip_dangerous_chat_commands_control_future_job_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut chat, mut db) = fixture(dir.path());
+        for command in [
+            "/skip-dangerous",
+            "/no-policy",
+            "/dangerously-skip-permissions",
+        ] {
+            chat.composer.value = command.into();
+            assert!(chat.suggestions().iter().any(|(name, _)| *name == command));
+            chat.command(&mut db, &mut None).unwrap();
+            assert!(
+                chat.arguments(vec!["run".into()])
+                    .contains(&"--no-policy".into())
+            );
+            chat.composer.value = format!("{command} off");
+            chat.command(&mut db, &mut None).unwrap();
+            assert!(
+                !chat
+                    .arguments(vec!["run".into()])
+                    .contains(&"--no-policy".into())
+            );
+            chat.composer.value = format!("{command} invalid");
+            assert!(chat.command(&mut db, &mut None).is_err());
+            assert!(!chat.options.no_policy);
+            chat.composer.value = format!("{command} on");
+            chat.command(&mut db, &mut None).unwrap();
+            assert!(chat.options.no_policy);
+        }
+    }
+
+    #[test]
+    fn no_policy_is_forwarded_to_chat_jobs_only_when_selected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut chat, _) = fixture(dir.path());
+        assert!(
+            !chat
+                .arguments(vec!["run".into()])
+                .contains(&"--no-policy".into())
+        );
+        chat.options.no_policy = true;
+        assert!(
+            chat.arguments(vec!["run".into()])
+                .contains(&"--no-policy".into())
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mermaid_responses_open_automatically_once_after_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut chat, db) = fixture(dir.path());
+        chat.choose();
+        assert!(!COMMANDS.iter().any(|(name, _)| *name == "/render"));
+        for (script, expected, preview) in [
+            ("printf 'plain answer\\n'", false, false),
+            ("printf '```mermaid\\ngraph TD; A-->B\\n'", false, false),
+            (
+                "printf '```mermaid\\ngraph TD; A-->B\\n```\\n'",
+                true,
+                false,
+            ),
+            (
+                "printf '```mermaid\\ngraph TD; A-->B\\n```\\n'",
+                false,
+                true,
+            ),
+        ] {
+            chat.note.clear();
+            fake_tab_job(&mut chat, "Resposta", script);
+            chat.running.as_mut().unwrap().preview = preview;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while chat.running.is_some() {
+                chat.poll(&db);
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                chat.note
+                    .iter()
+                    .any(|line| line.contains("Abertura automática")),
+                expected
+            );
+            let note = chat.note.clone();
+            chat.poll(&db);
+            chat.frame(100, 32);
+            assert_eq!(
+                chat.note, note,
+                "polling and redraw must not open another preview"
+            );
+            if expected {
+                let path = note[0].split_once(": ").unwrap().1;
+                assert!(std::path::Path::new(path).exists());
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn profile_picker_shows_trophy_without_changing_profile_identifier() {
         let dir = tempfile::tempdir().unwrap();
@@ -3842,6 +4304,173 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[cfg(unix)]
+    fn approval_fixture(chat: &mut Chat) -> (PathBuf, String) {
+        fake_tab_job(chat, "Permissão", "exec sleep 30");
+        let path_file = chat.cwd.join("mailbox-path");
+        chat.running.as_mut().unwrap().job = Job::start_tracked(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                "printf %s \"$STACKPULSE_CONTROL_DIR\" > \"$1\"; exec sleep 30".into(),
+                "fixture".into(),
+                path_file.as_os_str().to_owned(),
+            ],
+            &chat.cwd,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let path = loop {
+            if let Ok(value) = std::fs::read_to_string(&path_file)
+                && !value.is_empty()
+            {
+                break PathBuf::from(value).join("approvals");
+            }
+            assert!(Instant::now() < deadline, "fixture did not publish mailbox");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            path.join(format!("{id}.json")),
+            serde_json::to_vec(&crate::agent_control::ApprovalRequest {
+                request_id: id.clone(),
+                method: "item/commandExecution/requestApproval".into(),
+                params: serde_json::json!({
+                    "threadId": "thread-local", "command": "git commit -m teste",
+                    "cwd": "/projeto", "reason": "Registrar perfis",
+                    "changes": (0..40).map(|i| format!("change-{i}")).collect::<Vec<_>>(),
+                    "z_last": "final-detail",
+                }),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        (path, id)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn approvals_require_explicit_press_visible_details_and_preserve_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut chat, mut db) = fixture(dir.path());
+        chat.choose();
+        let (path, id) = approval_fixture(&mut chat);
+        let decision = path.join(format!("{id}.decision"));
+        chat.composer.value = "rascunho preservado".into();
+        let approve = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL);
+        chat.key(approve, &mut db, &mut None).unwrap();
+        assert!(!decision.exists(), "request must be rendered first");
+        let frame = chat.frame(100, 30);
+        let text = frame
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains(&id) && text.contains("Ctrl+Y") && text.contains("Ctrl+N"));
+        assert!(!text.contains("final-detail"));
+        for event in [
+            key(KeyCode::Enter),
+            key(KeyCode::Char('y')),
+            key(KeyCode::Char('n')),
+            KeyEvent::new_with_kind(
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Repeat,
+            ),
+        ] {
+            chat.key(event, &mut db, &mut None).unwrap();
+            assert!(!decision.exists());
+        }
+        chat.paste("não deve substituir o rascunho");
+        chat.key(key(KeyCode::End), &mut db, &mut None).unwrap();
+        let frame = chat.frame(100, 30);
+        let text = frame
+            .spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("final-detail") && text.contains("thread-local"));
+        assert!(text.contains("Registrar perfis") && text.contains("/projeto"));
+        chat.frame(40, 12);
+        chat.key(approve, &mut db, &mut None).unwrap();
+        assert!(!decision.exists(), "small terminal must disable approval");
+        chat.frame(100, 30);
+        chat.key(approve, &mut db, &mut None).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&decision).unwrap())
+                .unwrap()["accept"],
+            true
+        );
+        assert_eq!(chat.composer.value, "rascunho preservado");
+        assert!(
+            chat.running
+                .as_ref()
+                .unwrap()
+                .job
+                .pending_approvals()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn approvals_are_scoped_to_active_tab_and_denial_is_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut chat, mut db) = fixture(dir.path());
+        chat.choose();
+        let (path, id) = approval_fixture(&mut chat);
+        let decision = path.join(format!("{id}.decision"));
+        let request_file = path.join(format!("{id}.json"));
+        let mut request: crate::agent_control::ApprovalRequest =
+            serde_json::from_slice(&std::fs::read(&request_file).unwrap()).unwrap();
+        request.method = "item/permissions/requestApproval".into();
+        request.params = serde_json::json!({"threadId":"thread-local", "permissions":{"network":{"enabled":true}}});
+        std::fs::write(&request_file, serde_json::to_vec(&request).unwrap()).unwrap();
+        assert!(
+            chat.frame(100, 30)
+                .spans
+                .iter()
+                .any(|s| s.text.contains("nesta rodada"))
+        );
+        chat.new_session().unwrap();
+        assert!(
+            !chat
+                .frame(100, 30)
+                .spans
+                .iter()
+                .any(|s| s.text.contains("PERMISSÃO NECESSÁRIA"))
+        );
+        chat.key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &mut db,
+            &mut None,
+        )
+        .unwrap();
+        assert!(!decision.exists());
+        chat.switch_tab(0);
+        let deny = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL);
+        chat.key(deny, &mut db, &mut None).unwrap();
+        assert!(
+            !decision.exists(),
+            "switched tab must render its request first"
+        );
+        chat.frame(100, 30);
+        chat.key(deny, &mut db, &mut None).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(decision).unwrap())
+                .unwrap()["accept"],
+            false
+        );
+        assert_eq!(
+            chat.tabs.len(),
+            2,
+            "Ctrl+N denies instead of creating a tab"
+        );
+        assert!(!chat.running.as_ref().unwrap().job.cancelling());
     }
 
     fn click(chat: &mut Chat, db: &mut Db, x: usize, y: usize) {
@@ -4113,11 +4742,43 @@ mod tests {
         });
         chat.running = Some(Running {
             job,
+            approval_view: None,
+            preview: false,
             turn: chat.turns.len() - 1,
             emitted: None,
             last_metrics: Instant::now(),
             last_history: Instant::now(),
         });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn update_is_discoverable_and_rejects_arguments_and_busy_tabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut chat, mut db) = fixture(dir.path());
+        chat.composer.value = "/up".into();
+        assert!(chat.suggestions().iter().any(|(cmd, _)| *cmd == "/update"));
+        chat.composer.value = "/help".into();
+        chat.command(&mut db, &mut None).unwrap();
+        assert!(chat.note.iter().any(|line| line.contains("/update")));
+        chat.composer.value = "/update unexpected".into();
+        assert!(
+            chat.command(&mut db, &mut None)
+                .unwrap_err()
+                .to_string()
+                .contains("não aceita argumentos")
+        );
+        chat.choose();
+        fake_tab_job(&mut chat, "Pedido ativo", "sleep 0.1");
+        chat.new_session().unwrap();
+        chat.composer.value = "/update".into();
+        assert!(
+            chat.command(&mut db, &mut None)
+                .unwrap_err()
+                .to_string()
+                .contains("pedidos em execução")
+        );
+        chat.finish_all(&db).unwrap();
     }
 
     #[test]
@@ -4207,6 +4868,7 @@ mod tests {
         let all = dir.join("providers/project/all");
         std::fs::write(all.join(format!("{name}.png")), b"image fixture").unwrap();
         let agent = |role: String| AgentSpec {
+            provider: None,
             role,
             model: "gpt-6-astra".into(),
             effort: "medium".into(),
@@ -4884,6 +5546,136 @@ mod tests {
     }
 
     #[test]
+    fn newline_shortcuts_edit_main_agent_and_multiline_form_drafts_without_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut chat, mut db) = fixture(dir.path());
+        compiled_profile(dir.path(), "selected", 0, "on_demand");
+        chat.refresh_profiles();
+        chat.choose();
+        let shortcuts = [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ];
+        for shortcut in shortcuts {
+            chat.composer = Composer::default();
+            chat.paste("a界b");
+            chat.composer.cursor = 4;
+            chat.key(shortcut, &mut db, &mut None).unwrap();
+            assert_eq!(chat.composer.value, "a界\nb");
+            assert_eq!(chat.composer.cursor, 5);
+        }
+        chat.agent_view.selected = Some("child".into());
+        chat.agent_view.focused = true;
+        for shortcut in shortcuts {
+            chat.key(shortcut, &mut db, &mut None).unwrap();
+        }
+        assert_eq!(chat.agent_view.drafts["child"].value, "\n\n\n");
+        chat.agent_view.selected = None;
+        completed_measured_turn(&mut chat, &mut db, "Resultado", 42);
+        chat.edit_form(Action::Feedback).unwrap();
+        let Stage::Form(editor) = &mut chat.stage else {
+            panic!("form expected")
+        };
+        editor.selected = editor
+            .indices
+            .iter()
+            .position(|index| editor.form.fields[*index].multiline)
+            .unwrap();
+        let selected = editor.selected;
+        editor.inputs[selected] = Composer::default();
+        for shortcut in shortcuts {
+            chat.key(shortcut, &mut db, &mut None).unwrap();
+        }
+        let Stage::Form(editor) = &chat.stage else {
+            panic!("form must remain open")
+        };
+        assert_eq!(editor.selected, selected);
+        assert_eq!(editor.inputs[selected].value, "\n\n\n");
+        assert!(!chat.any_running());
+        assert_eq!(db.executions().unwrap().len(), 1);
+        assert_eq!(chat.turns.len(), 1);
+        assert!(!is_newline(key(KeyCode::Enter)));
+    }
+
+    #[test]
+    fn selection_mode_protects_draft_from_submit_copy_and_paste_until_explicit_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut chat, mut db) = fixture(dir.path());
+        chat.choose();
+        chat.paste("/exit");
+        chat.key(key(KeyCode::F(8)), &mut db, &mut None).unwrap();
+        assert!(chat.selecting_text);
+        for input in [
+            key(KeyCode::Enter),
+            key(KeyCode::Char('x')),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        ] {
+            assert!(!chat.key(input, &mut db, &mut None).unwrap());
+        }
+        chat.paste("unexpected clipboard");
+        assert_eq!(chat.composer.value, "/exit");
+        assert_eq!(chat.tabs.len(), 1);
+        for (width, height) in [(64, 20), (80, 24)] {
+            let frame = chat.frame(width, height);
+            assert!(frame.caret.is_none());
+            assert!(
+                frame
+                    .spans
+                    .iter()
+                    .any(|span| span.text.contains("COPIAR:") && span.text.contains("F8/Esc"))
+            );
+        }
+        chat.key(
+            KeyEvent::new_with_kind(KeyCode::F(8), KeyModifiers::NONE, KeyEventKind::Repeat),
+            &mut db,
+            &mut None,
+        )
+        .unwrap();
+        assert!(chat.selecting_text);
+        chat.key(key(KeyCode::Esc), &mut db, &mut None).unwrap();
+        assert!(!chat.selecting_text);
+        assert!(chat.key(key(KeyCode::Enter), &mut db, &mut None).unwrap());
+        chat.key(key(KeyCode::F(8)), &mut db, &mut None).unwrap();
+        chat.key(key(KeyCode::F(8)), &mut db, &mut None).unwrap();
+        assert!(!chat.selecting_text);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn selection_mode_keeps_background_requests_running_and_polling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut chat, mut db) = fixture(dir.path());
+        chat.choose();
+        fake_tab_job(
+            &mut chat,
+            "Copiar durante execução",
+            "sleep 0.05; printf 'concluido\\n'",
+        );
+        chat.key(key(KeyCode::F(8)), &mut db, &mut None).unwrap();
+        chat.key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut db,
+            &mut None,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while chat.any_running() && Instant::now() < deadline {
+            chat.poll_all(&db);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!chat.any_running());
+        assert!(chat.selecting_text);
+        assert!(
+            chat.turns[0]
+                .lines
+                .iter()
+                .any(|line| line.contains("concluido"))
+        );
+    }
+
+    #[test]
     fn newline_exit_and_profile_switch_are_local_commands_not_requests() {
         let dir = tempfile::tempdir().unwrap();
         let (mut chat, mut db) = fixture(dir.path());
@@ -4966,6 +5758,146 @@ mod tests {
         assert_eq!(chat.turns[0].profile, "selected");
         assert_eq!(chat.chosen.as_ref().unwrap().name, "selected");
         assert!(db.executions().unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn send_transports_session_history_after_clear_profile_change_new_and_reopen() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("fake-stackpulse");
+        fs::write(&executable, r#"#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+path = Path(args[args.index('--chat-context') + 1])
+context = path.read_text()
+with Path('received.jsonl').open('a') as output:
+    output.write(json.dumps({'context':json.loads(context) if context else None, 'prompt':args[-1], 'path':str(path), 'mode':path.stat().st_mode & 0o777, 'args':args}) + '\n')
+print('ANSWER-BEGIN:' + args[-1])
+if args[-1] == 'primeiro pedido':
+    for i in range(350):
+        print(str(i) + ':' + 'resposta extensa ' * 20)
+print('ANSWER-END:' + args[-1])
+"#).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let finish = |chat: &mut Chat, db: &Db| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while chat.running.is_some() {
+                chat.poll(db);
+                assert!(Instant::now() < deadline, "fake chat runner did not finish");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(chat.turns.last().unwrap().status, "Concluído");
+        };
+        let captured = || -> Vec<serde_json::Value> {
+            fs::read_to_string(dir.path().join("received.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        };
+        let (mut chat, mut db) = fixture(dir.path());
+        chat.choose();
+        chat.executable = executable.clone();
+        let first = chat.session.id.clone();
+        chat.send("primeiro pedido".into(), false).unwrap();
+        finish(&mut chat, &db);
+        assert!(captured()[0]["context"].is_null());
+        assert_eq!(
+            chat.turns[0].lines.len(),
+            352,
+            "completed answers must outlive the UI tail"
+        );
+        chat.paste("/clear");
+        chat.key(key(KeyCode::Enter), &mut db, &mut None).unwrap();
+        chat.chosen.as_mut().unwrap().name = "outra-equipe".into();
+        chat.send("continuação única".into(), false).unwrap();
+        finish(&mut chat, &db);
+        let rows = captured();
+        let context = &rows[1]["context"];
+        assert_eq!(context["session_id"], first);
+        assert_eq!(context["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(context["turns"][0]["user"], "primeiro pedido");
+        assert_eq!(context["turns"][0]["profile"], "selected");
+        assert!(
+            context["turns"][0]["assistant"]
+                .as_str()
+                .unwrap()
+                .starts_with("ANSWER-BEGIN:")
+        );
+        assert!(
+            context["turns"][0]["assistant"]
+                .as_str()
+                .unwrap()
+                .ends_with("ANSWER-END:primeiro pedido")
+        );
+        assert!(!context.to_string().contains("continuação única"));
+        assert_eq!(
+            chat.history.read_session(&first).unwrap().turns[1].prompt,
+            "continuação única"
+        );
+
+        chat.new_session().unwrap();
+        chat.send("pedido isolado".into(), false).unwrap();
+        finish(&mut chat, &db);
+        assert!(captured()[2]["context"].is_null());
+        drop(chat);
+
+        let (mut reopened, db) = fixture(dir.path());
+        reopened.executable = executable;
+        reopened.load_session(&first).unwrap();
+        reopened.choose();
+        // A literal separator is still the user's prompt, never an option slot.
+        reopened.send("--".into(), false).unwrap();
+        finish(&mut reopened, &db);
+        let rows = captured();
+        assert_eq!(rows[3]["prompt"], "--");
+        let turns = rows[3]["context"]["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[1]["user"], "continuação única");
+        assert_eq!(turns[1]["profile"], "outra-equipe");
+        assert!(!rows[3]["context"].to_string().contains("pedido isolado"));
+        for row in rows {
+            assert_eq!(row["mode"], 0o600);
+            assert!(!Path::new(row["path"].as_str().unwrap()).exists());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn previews_from_command_and_options_do_not_become_conversation_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut chat, db) = fixture(dir.path());
+        chat.choose();
+        chat.executable = "/usr/bin/true".into();
+        for explicit in [true, false] {
+            chat.run_form.fields[5].value = if explicit { "não" } else { "sim" }.into();
+            chat.send("pedido de prévia".into(), explicit).unwrap();
+            assert!(chat.running.as_ref().unwrap().preview);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while chat.running.is_some() {
+                chat.poll(&db);
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(chat.turns.last().unwrap().status, "Prévia · Concluído");
+            assert!(chat.history.context(&chat.session.id).unwrap().is_empty());
+        }
+        chat.run_form.fields[5].value = "não".into();
+        chat.run_form.fields[2].value = "--dry-run".into();
+        chat.send("--dry-run".into(), false).unwrap();
+        assert!(!chat.running.as_ref().unwrap().preview);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while chat.running.is_some() {
+            chat.poll(&db);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let context: serde_json::Value =
+            serde_json::from_str(&chat.history.context(&chat.session.id).unwrap()).unwrap();
+        assert_eq!(context["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(context["turns"][0]["user"], "--dry-run");
     }
 
     #[test]

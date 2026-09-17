@@ -27,7 +27,7 @@ A importação preserva prompts, respostas públicas de texto, datas e a identif
 
 A mesma origem (`client` + `session_id`) é importada uma única vez por projeto. Reimportar não atualiza nem duplica uma conversa existente, inclusive se o arquivo de origem tiver crescido. Outros clientes e versões incompatíveis são recusados com uma mensagem; os arquivos de origem nunca são modificados.
 
-Importar uma conversa permite **consultar seu histórico**. Os próximos pedidos continuam sendo execuções independentes: o transcript não é enviado automaticamente como contexto ao provider. Referências a arquivos ou imagens externas não empacotam esses arquivos. Conteúdo de imagem embutido nos eventos de origem é preservado no JSONL, mas não é renderizado no chat importado.
+Importar uma conversa permite **consultar seu histórico e continuar a conversa**. Ao enviar um novo pedido, o histórico textual salvo da sessão é incluído automaticamente no contexto do agente. A importação e a reabertura, por si só, não executam pedidos. Cada envio inicia uma execução do CLI; não retoma a sessão nativa do cliente nem restaura estados internos de ferramentas. Referências a arquivos ou imagens externas não empacotam esses arquivos. Conteúdo de imagem embutido nos eventos de origem é preservado no JSONL, mas não é renderizado no chat importado.
 
 ## Formato versão 1
 

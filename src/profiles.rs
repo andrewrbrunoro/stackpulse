@@ -71,6 +71,8 @@ impl Settings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub role: String,
     pub model: String,
     pub effort: String,
@@ -91,6 +93,59 @@ pub struct TeamSpec {
 }
 
 impl TeamSpec {
+    pub fn provider_for<'a>(&'a self, agent: &'a AgentSpec) -> &'a str {
+        agent.provider.as_deref().unwrap_or(&self.provider)
+    }
+
+    pub fn root_provider(&self) -> &str {
+        self.provider_for(&self.orchestrator)
+    }
+
+    pub fn is_mixed(&self) -> bool {
+        let root = self.root_provider();
+        self.agents.iter().any(|agent| {
+            let provider = self.provider_for(agent);
+            provider != root
+                && match (
+                    crate::client::Backend::for_provider(root),
+                    crate::client::Backend::for_provider(provider),
+                ) {
+                    (Some(root), Some(child)) => root != child,
+                    _ => true,
+                }
+        })
+    }
+
+    /// Runtime compatibility without probing installed CLIs or authenticating.
+    pub fn validate_execution_providers(&self) -> Result<()> {
+        if !self.is_mixed() {
+            return Ok(());
+        }
+        use crate::client::Backend;
+        ensure!(
+            matches!(
+                Backend::for_provider(self.root_provider()),
+                Some(Backend::Codex | Backend::Claude)
+            ),
+            "Equipes com múltiplos providers exigem root Codex/Claude; provider recebido: {}",
+            self.root_provider()
+        );
+        for agent in &self.agents {
+            ensure!(
+                Backend::for_provider(self.provider_for(agent)) != Some(Backend::Cursor),
+                "O papel {} usa Cursor, cujo adaptador ainda não desativa subagentes nativos; use Codex, Claude ou Grok na ponte.",
+                agent.role
+            );
+            ensure!(
+                Backend::for_provider(self.provider_for(agent)).is_some(),
+                "Nenhum adaptador para o provider {} do papel {}",
+                self.provider_for(agent),
+                agent.role
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         identifier(&self.name)?;
         identifier(&self.provider)?;
@@ -98,6 +153,9 @@ impl TeamSpec {
         let mut roles = std::collections::HashSet::new();
         for a in std::iter::once(&self.orchestrator).chain(&self.agents) {
             identifier(&a.role)?;
+            if let Some(provider) = &a.provider {
+                identifier(provider)?;
+            }
             model_id(&a.model)?;
             if a.effort != "unknown" {
                 effort(&a.effort)?;
@@ -195,15 +253,16 @@ pub fn markdown(profile: &Profile) -> Result<String> {
     profile.team.validate()?;
     let t = &profile.team;
     let mut s = format!(
-        "+++\n{}+++\n\n# {}\n\nPerfil extraído de `{}`. A configuração executável está no bloco TOML acima.\n\n| Papel | Modelo | Esforço | Quando |\n|---|---|---|---|\n",
+        "+++\n{}+++\n\n# {}\n\nPerfil extraído de `{}`. A configuração executável está no bloco TOML acima.\n\n| Papel | Provider | Modelo | Esforço | Quando |\n|---|---|---|---|---|\n",
         toml::to_string_pretty(profile)?,
         t.name,
         profile.source_image
     );
     for a in std::iter::once(&t.orchestrator).chain(&t.agents) {
         s.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} |\n",
             a.role,
+            t.provider_for(a),
             a.model,
             a.effort,
             a.when.replace('|', "/").replace('\n', " ")
@@ -356,7 +415,7 @@ pub fn check_image(profile: &Profile, md: &Path) -> Result<()> {
 
 pub fn extraction_schema() -> serde_json::Value {
     let agent = serde_json::json!({"type":"object","additionalProperties":false,"properties":{
-        "role":{"type":"string","pattern":"^[a-zA-Z0-9_-]+$"},"model":{"type":"string"},"effort":{"type":"string","enum":["unknown","none","minimal","low","medium","high","xhigh","max","ultra"]},"purpose":{"type":"string"},"when":{"type":"string"}},"required":["role","model","effort","purpose","when"]});
+        "provider":{"type":["string","null"],"pattern":"^[a-zA-Z0-9_-]+$"},"role":{"type":"string","pattern":"^[a-zA-Z0-9_-]+$"},"model":{"type":"string"},"effort":{"type":"string","enum":["unknown","none","minimal","low","medium","high","xhigh","max","ultra"]},"purpose":{"type":"string"},"when":{"type":"string"}},"required":["provider","role","model","effort","purpose","when"]});
     serde_json::json!({"type":"object","additionalProperties":false,"properties":{
         "name":{"type":"string"},"provider":{"type":"string","pattern":"^[a-zA-Z0-9_-]+$"},"orchestrator":agent,
         "agents":{"type":"array","items":agent},"delegation":{"type":"string","enum":["on_demand","parallel","sequential"]},
@@ -378,12 +437,14 @@ pub fn load_for_run(
     }
     let (profile, md) = read(&d.path)?;
     ensure!(
-        profile.team.provider != "unknown"
-            && std::iter::once(&profile.team.orchestrator)
-                .chain(&profile.team.agents)
-                .all(|a| a.model != "unknown" && a.effort != "unknown"),
+        std::iter::once(&profile.team.orchestrator)
+            .chain(&profile.team.agents)
+            .all(|a| profile.team.provider_for(a) != "unknown"
+                && a.model != "unknown"
+                && a.effort != "unknown"),
         "Perfil contém campos unknown; complete o TOML do Markdown antes de executar"
     );
+    profile.team.validate_execution_providers()?;
     check_image(&profile, &d.path)?;
     Ok((d, profile, md))
 }

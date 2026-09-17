@@ -145,15 +145,27 @@ struct ControlSnapshot {
     receipts: Vec<ControlReceipt>,
 }
 
+/// One runtime request; the opaque local ID never contains a filesystem path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ApprovalRequest {
+    pub request_id: String,
+    pub method: String,
+    pub params: Value,
+}
+
 /// Owned by Job, never reused across runs or inherited by the native provider.
-pub(crate) struct Mailbox(TempDir);
+pub(crate) struct Mailbox(TempDir, [u8; 32]);
 impl Mailbox {
     pub(crate) fn new() -> Result<Self> {
         let directory = tempfile::Builder::new()
             .prefix("stackpulse-control-")
             .tempdir()?;
         fs::create_dir(directory.path().join("requests"))?;
-        let mailbox = Self(directory);
+        fs::create_dir(directory.path().join("approvals"))?;
+        let mut key = [0_u8; 32];
+        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        let mailbox = Self(directory, key);
         write_state(
             mailbox.path(),
             &ControlSnapshot {
@@ -164,6 +176,9 @@ impl Mailbox {
             },
         )?;
         Ok(mailbox)
+    }
+    pub(crate) fn approval_key(&self) -> &[u8; 32] {
+        &self.1
     }
     pub(crate) fn path(&self) -> &Path {
         self.0.path()
@@ -178,6 +193,47 @@ impl Mailbox {
     }
     fn snapshot(&self) -> Option<ControlSnapshot> {
         read_json(&self.path().join("state.json"), MAX_STATE).ok()
+    }
+    pub(crate) fn approvals(&self) -> Vec<ApprovalRequest> {
+        let Ok(entries) = fs::read_dir(self.path().join("approvals")) else {
+            return Vec::new();
+        };
+        let mut requests: Vec<ApprovalRequest> = entries
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .filter_map(|entry| read_json(&entry.path(), MAX_STATE).ok())
+            .filter(|request: &ApprovalRequest| {
+                !self
+                    .path()
+                    .join("approvals")
+                    .join(format!("{}.decision", request.request_id))
+                    .exists()
+            })
+            .collect();
+        requests.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+        requests
+    }
+    pub(crate) fn decide_approval(&self, request: &ApprovalRequest, accept: bool) -> Result<()> {
+        let request_id = &request.request_id;
+        ensure!(
+            uuid::Uuid::parse_str(request_id).is_ok(),
+            "Identificador de aprovação inválido"
+        );
+        let dir = self.path().join("approvals");
+        let current: ApprovalRequest =
+            read_json(&dir.join(format!("{request_id}.json")), MAX_STATE)
+                .context("O pedido de permissão já encerrou")?;
+        ensure!(
+            &current == request,
+            "O pedido mudou; revise os detalhes novamente"
+        );
+        let mut file = tempfile::NamedTempFile::new_in(&dir)?;
+        serde_json::to_writer(
+            &mut file,
+            &ApprovalDecision::signed(&self.1, request, accept),
+        )?;
+        file.persist_noclobber(dir.join(format!("{request_id}.decision")))?;
+        Ok(())
     }
     pub(crate) fn submit(
         &self,
@@ -287,6 +343,7 @@ struct PendingControl {
 }
 struct Inbox {
     path: PathBuf,
+    approval_key: [u8; 32],
     snapshot: ControlSnapshot,
     seen: HashSet<String>,
     pending: Vec<PendingControl>,
@@ -294,13 +351,14 @@ struct Inbox {
     agent_aliases: HashMap<String, String>,
 }
 impl Inbox {
-    fn open(path: PathBuf) -> Result<Self> {
+    fn open(path: PathBuf, approval_key: [u8; 32]) -> Result<Self> {
         ensure!(
             path.join("requests").is_dir(),
             "Canal privado da execução indisponível"
         );
         Ok(Self {
             path,
+            approval_key,
             snapshot: ControlSnapshot {
                 capability: ControlCapability::unavailable("Conectando ao runtime do Codex…"),
                 receipts: Vec::new(),
@@ -553,6 +611,7 @@ impl Inbox {
         }
     }
     fn finish(&mut self, detail: &str) {
+        let _ = fs::remove_dir_all(self.path.join("approvals"));
         self.snapshot.capability = ControlCapability::unavailable(
             "A execução terminou; o canal de controle está fechado.",
         );
@@ -578,6 +637,204 @@ impl Inbox {
     }
     fn flush(&self) -> Result<()> {
         write_state(&self.path, &self.snapshot)
+    }
+}
+
+// The key travels only through the UI child's anonymous stdin pipe. Bind the
+// decision to every displayed field, not just an ID in a writable temp file.
+#[derive(Serialize, Deserialize)]
+struct ApprovalDecision {
+    accept: bool,
+    mac: [u8; 32],
+}
+impl ApprovalDecision {
+    fn signed(key: &[u8; 32], request: &ApprovalRequest, accept: bool) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut inner_pad = [0x36_u8; 64];
+        let mut outer_pad = [0x5c_u8; 64];
+        for i in 0..32 {
+            inner_pad[i] ^= key[i];
+            outer_pad[i] ^= key[i];
+        }
+        let mut inner = Sha256::new();
+        inner.update(inner_pad);
+        inner.update(serde_json::to_vec(&(request, accept)).expect("serializable approval"));
+        let mut outer = Sha256::new();
+        outer.update(outer_pad);
+        outer.update(inner.finalize());
+        Self {
+            accept,
+            mac: outer.finalize().into(),
+        }
+    }
+    fn valid(&self, key: &[u8; 32], request: &ApprovalRequest) -> bool {
+        let expected = Self::signed(key, request, self.accept);
+        self.mac
+            .iter()
+            .zip(expected.mac)
+            .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
+    }
+}
+
+struct PendingApprovals {
+    directory: PathBuf,
+    key: [u8; 32],
+    requests: Vec<(Value, ApprovalRequest)>,
+}
+impl PendingApprovals {
+    fn new(directory: PathBuf, key: [u8; 32]) -> Self {
+        Self {
+            directory,
+            key,
+            requests: Vec::new(),
+        }
+    }
+    fn enqueue(
+        &mut self,
+        value: &Value,
+        known: &HashSet<String>,
+        items: &HashMap<String, Value>,
+    ) -> Result<bool> {
+        let method = value["method"].as_str().unwrap_or_default();
+        if !matches!(
+            method,
+            "item/commandExecution/requestApproval"
+                | "item/fileChange/requestApproval"
+                | "item/permissions/requestApproval"
+                | "mcpServer/elicitation/request"
+        ) || !value["params"]["threadId"]
+            .as_str()
+            .is_some_and(|id| known.contains(id))
+            || self.requests.len() >= MAX_REQUESTS
+            || self.requests.iter().any(|(id, _)| id == &value["id"])
+        {
+            return Ok(false);
+        }
+        let mut params = value["params"].clone();
+        // Empty MCP forms are confirmations, including tool-call approvals.
+        // Do not synthesize answers for forms requiring user data or URL flows.
+        if method == "mcpServer/elicitation/request"
+            && (params["mode"] != "form"
+                || params["requestedSchema"]["type"] != "object"
+                || !params["requestedSchema"]["properties"]
+                    .as_object()
+                    .is_some_and(|fields| fields.is_empty())
+                || !(params["requestedSchema"]["required"].is_null()
+                    || params["requestedSchema"]["required"]
+                        .as_array()
+                        .is_some_and(|fields| fields.is_empty())))
+        {
+            return Ok(false);
+        }
+        if let Some(item) = params["itemId"]
+            .as_str()
+            .and_then(|id| items.get(&format!("{}:{id}", params["threadId"])))
+        {
+            params["itemDetails"] = item.clone();
+        }
+        if method == "item/fileChange/requestApproval"
+            && !params["itemDetails"]["changes"]
+                .as_array()
+                .is_some_and(|changes| !changes.is_empty())
+        {
+            return Ok(false);
+        }
+        let request = ApprovalRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            method: method.into(),
+            params,
+        };
+        let mut file = tempfile::NamedTempFile::new_in(&self.directory)?;
+        serde_json::to_writer(&mut file, &request)?;
+        ensure!(
+            file.as_file().metadata()?.len() <= MAX_STATE,
+            "Pedido de aprovação grande demais"
+        );
+        file.persist_noclobber(self.directory.join(format!("{}.json", request.request_id)))?;
+        self.requests.push((value["id"].clone(), request));
+        Ok(true)
+    }
+    fn response(request: &ApprovalRequest, accept: bool) -> Value {
+        if request.method == "mcpServer/elicitation/request" {
+            json!({"action": if accept { "accept" } else { "decline" },
+                "content": if accept { json!({}) } else { Value::Null }})
+        } else if request.method == "item/permissions/requestApproval" {
+            let mut permissions = serde_json::Map::new();
+            if accept {
+                for key in ["network", "fileSystem"] {
+                    if let Some(value) = request.params["permissions"]
+                        .get(key)
+                        .filter(|v| !v.is_null())
+                    {
+                        permissions.insert(key.into(), value.clone());
+                    }
+                }
+            }
+            json!({"permissions":permissions,"scope":"turn"})
+        } else {
+            json!({"decision":if accept { "accept" } else { "decline" }})
+        }
+    }
+    fn remove_files(&self, request: &ApprovalRequest) {
+        for suffix in ["json", "decision"] {
+            let _ = fs::remove_file(
+                self.directory
+                    .join(format!("{}.{suffix}", request.request_id)),
+            );
+        }
+    }
+    fn resolve(&mut self, id: &Value) {
+        if let Some(index) = self.requests.iter().position(|(rpc_id, _)| rpc_id == id) {
+            let (_, request) = self.requests.remove(index);
+            self.remove_files(&request);
+        }
+    }
+    fn end_turn(&mut self, params: &Value, writer: &RpcWriter) -> Result<()> {
+        let ids: Vec<_> = self
+            .requests
+            .iter()
+            .filter(|(_, request)| {
+                request.params["threadId"] == params["threadId"]
+                    && request.params["turnId"] == params["turn"]["id"]
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Some((_, request)) = self.requests.iter().find(|(rpc_id, _)| rpc_id == &id) {
+                writer.send(json!({"id":id,"result":Self::response(request, false)}))?;
+            }
+            self.resolve(&id);
+        }
+        Ok(())
+    }
+    fn poll(&mut self, writer: &RpcWriter) -> Result<()> {
+        let mut done = Vec::new();
+        for (id, request) in &self.requests {
+            let path = self
+                .directory
+                .join(format!("{}.decision", request.request_id));
+            if path.exists() {
+                let decision: Option<ApprovalDecision> = read_json(&path, 1024).ok();
+                let Some(decision) = decision.filter(|d| d.valid(&self.key, request)) else {
+                    let _ = fs::remove_file(path);
+                    continue;
+                };
+                writer.send(json!({"id":id,"result":Self::response(request, decision.accept)}))?;
+                done.push(id.clone());
+            }
+        }
+        for id in done {
+            self.resolve(&id);
+        }
+        Ok(())
+    }
+}
+impl Drop for PendingApprovals {
+    fn drop(&mut self) {
+        for (_, request) in &self.requests {
+            self.remove_files(request);
+        }
     }
 }
 
@@ -619,7 +876,11 @@ pub(crate) fn execute(
     mut events: impl FnMut(Option<&str>),
 ) -> Result<Outcome> {
     let path = PathBuf::from(std::env::var_os(ENV_PATH).context("Canal de controle ausente")?);
-    let mut inbox = Inbox::open(path)?;
+    let mut key = [0_u8; 32];
+    std::io::stdin()
+        .read_exact(&mut key)
+        .context("Canal privado de aprovação ausente")?;
+    let mut inbox = Inbox::open(path, key)?;
     inbox.flush()?;
     let result = execute_inner(&request, &mut inbox, &mut progress, &mut events);
     inbox.finish("A execução encerrou sem confirmação suficiente do repasse ao agente. A orientação não será reenviada automaticamente.");
@@ -707,6 +968,8 @@ fn execute_inner(
     let mut known = HashSet::<String>::new();
     let mut next_id = 4_u64;
     let mut pending_rpc: HashMap<u64, (String, Instant)> = HashMap::new();
+    let mut approvals = PendingApprovals::new(inbox.path.join("approvals"), inbox.approval_key);
+    let mut approval_items = HashMap::<String, Value>::new();
     let deadline = Instant::now() + Duration::from_secs(request.timeout_secs);
     let startup_deadline = Instant::now() + RPC_TIMEOUT;
     let mut initialized_turn = false;
@@ -748,7 +1011,7 @@ fn execute_inner(
                                 json!({
                                     "model": (request.model != "default").then_some(request.model),
                                     "modelProvider": (request.provider != "default").then_some(request.provider),
-                                    "cwd": request.cwd, "sandbox": request.sandbox, "approvalPolicy":"never",
+                                    "cwd": request.cwd, "sandbox": request.sandbox, "approvalPolicy": if request.sandbox == "danger-full-access" { "never" } else { "on-request" }, "approvalsReviewer":"user",
                                     "ephemeral":false,"experimentalRawEvents":true
                                 }),
                             )?;
@@ -830,12 +1093,36 @@ fn execute_inner(
                         }
                     }
                 } else if value.get("id").is_some() && value.get("method").is_some() {
-                    // Match exec's unattended approval ceiling. No automatic privilege escalation.
-                    let response = json!({"id":value["id"],"error":{"code":-32000,"message":"Interação não disponível nesta execução StackPulse; solicitação não aprovada."}});
-                    stdin.send(response)?;
+                    if !approvals.enqueue(&value, &known, &approval_items)? {
+                        stdin.send(json!({"id":value["id"],"error":{"code":-32000,"message":"Interação não suportada ou conversa desconhecida; solicitação não aprovada."}}))?;
+                    }
                 } else if let Some(method) = value["method"].as_str() {
                     let params = &value["params"];
                     observe_tree(method, params, &mut known);
+                    if method == "serverRequest/resolved" {
+                        approvals.resolve(&params["requestId"]);
+                    }
+                    if method == "turn/completed" {
+                        approvals.end_turn(params, &stdin)?;
+                    }
+                    if method == "item/completed" {
+                        if let Some(id) = params["item"]["id"].as_str() {
+                            approval_items.remove(&format!("{}:{id}", params["threadId"]));
+                        }
+                    }
+                    if matches!(method, "item/started" | "item/updated")
+                        && params["item"]["type"] == "fileChange"
+                        && params["threadId"]
+                            .as_str()
+                            .is_some_and(|id| known.contains(id))
+                        && let Some(id) = params["item"]["id"].as_str()
+                        && approval_items.len() < 512
+                    {
+                        approval_items.insert(
+                            format!("{}:{id}", params["threadId"]),
+                            params["item"].clone(),
+                        );
+                    }
                     if method == "item/completed"
                         && params["item"]["type"] == "subAgentActivity"
                         && params["threadId"]
@@ -892,6 +1179,7 @@ fn execute_inner(
                 break;
             }
         }
+        approvals.poll(&stdin)?;
         let expired: Vec<_> = pending_rpc
             .iter()
             .filter(|(_, (_, at))| at.elapsed() >= RPC_TIMEOUT)
@@ -1116,7 +1404,7 @@ mod tests {
         let mailbox = Mailbox::new().unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         assert!(mailbox.submit(&id, CHILD, "orientação", false).is_err());
-        let mut inbox = Inbox::open(mailbox.path().into()).unwrap();
+        let mut inbox = Inbox::open(mailbox.path().into(), *mailbox.approval_key()).unwrap();
         inbox.ready();
         inbox.flush().unwrap();
         mailbox.submit(&id, CHILD, "orientação", false).unwrap();
@@ -1148,7 +1436,7 @@ mod tests {
     #[test]
     fn guidance_requires_exact_message_target_and_native_ack() {
         let mailbox = Mailbox::new().unwrap();
-        let mut inbox = Inbox::open(mailbox.path().into()).unwrap();
+        let mut inbox = Inbox::open(mailbox.path().into(), *mailbox.approval_key()).unwrap();
         let request = pending(&mut inbox, false, true);
         v2_call(&mut inbox, &request, "send_message", &request.marker());
         assert!(
@@ -1170,7 +1458,7 @@ mod tests {
     #[test]
     fn redirect_needs_both_native_operations_and_root_ack() {
         let mailbox = Mailbox::new().unwrap();
-        let mut inbox = Inbox::open(mailbox.path().into()).unwrap();
+        let mut inbox = Inbox::open(mailbox.path().into(), *mailbox.approval_key()).unwrap();
         let request = pending(&mut inbox, true, false);
         let text = format!("{}\n{}", request.marker(), request.message);
         v2_call(&mut inbox, &request, "followup_task", &text);
@@ -1188,7 +1476,7 @@ mod tests {
     #[test]
     fn completed_tool_with_missing_target_is_not_delivery() {
         let mailbox = Mailbox::new().unwrap();
-        let mut inbox = Inbox::open(mailbox.path().into()).unwrap();
+        let mut inbox = Inbox::open(mailbox.path().into(), *mailbox.approval_key()).unwrap();
         let request = pending(&mut inbox, false, true);
         inbox.tool_event(&json!({"item":{"type":"collabAgentToolCall","senderThreadId":ROOT,"receiverThreadIds":[CHILD],"tool":"sendMessage","status":"completed",
             "prompt":format!("{}\n{}",request.marker(),request.message),"agentsStates":{CHILD:{"status":"notFound"}}}}), ROOT);
@@ -1249,6 +1537,13 @@ mod tests {
         assert!(outcome.final_message.is_empty());
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn no_policy_reaches_app_server() {
+        let (outcome, _, _, _) = run_fixture("no_policy", false, 100);
+        assert!(outcome.success(), "{outcome:?}");
+    }
+
     #[cfg(unix)]
     fn run_fixture(
         mode: &str,
@@ -1265,7 +1560,7 @@ mod tests {
         )
         .unwrap();
         let mailbox = Mailbox::new().unwrap();
-        let mut inbox = Inbox::open(mailbox.path().into()).unwrap();
+        let mut inbox = Inbox::open(mailbox.path().into(), *mailbox.approval_key()).unwrap();
         let settings = crate::profiles::Settings {
             schema_version: 1,
             client: crate::client::Backend::Codex,
@@ -1290,7 +1585,11 @@ mod tests {
             prompt: &prompt,
             image: None,
             output_schema: None,
-            sandbox: "workspace-write",
+            sandbox: if mode == "no_policy" {
+                "danger-full-access"
+            } else {
+                "workspace-write"
+            },
             timeout_secs: 2,
             delegates: true,
             team: None,
@@ -1299,9 +1598,24 @@ mod tests {
         let mut sent = false;
         let started = Instant::now();
         let outcome = execute_inner(&request, &mut inbox, &mut |_| Ok(()), &mut |line| {
+            if mode.starts_with("approval_")
+                && !sent
+                && started.elapsed() > Duration::from_millis(200)
+            {
+                if let Some(approval) = mailbox.approvals().first() {
+                    mailbox
+                        .decide_approval(&approval, mode.ends_with("_accept"))
+                        .unwrap();
+                    sent = true;
+                }
+            }
             if let Some(line) = line {
                 observed.push(line.to_owned());
-                if line.contains("thread/started") && line.contains(CHILD) && !sent {
+                if !mode.starts_with("approval_")
+                    && line.contains("thread/started")
+                    && line.contains(CHILD)
+                    && !sent
+                {
                     mailbox
                         .submit(
                             &uuid::Uuid::new_v4().to_string(),
@@ -1322,6 +1636,202 @@ mod tests {
             observed,
             started.elapsed(),
         )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn fake_server_waits_for_explicit_approval_and_receives_both_decisions() {
+        for mode in [
+            "approval_accept",
+            "approval_decline",
+            "approval_mcp_accept",
+            "approval_mcp_decline",
+        ] {
+            let (outcome, _, events, elapsed) = run_fixture(mode, false, 100);
+            assert!(outcome.success(), "{outcome:?}");
+            assert!(elapsed >= Duration::from_millis(200));
+            assert!(
+                events
+                    .iter()
+                    .any(|line| line.contains("fixture/approvalReceived"))
+            );
+        }
+    }
+
+    #[test]
+    fn approvals_require_a_decision_and_do_not_survive_resolution_or_shutdown() {
+        let mailbox = Mailbox::new().unwrap();
+        let mut pending =
+            PendingApprovals::new(mailbox.path().join("approvals"), *mailbox.approval_key());
+        let known = HashSet::from([ROOT.to_string()]);
+        let request = json!({"id":"opaque/rpc-id","method":"item/commandExecution/requestApproval","params":{"threadId":ROOT,"turnId":"turn","command":"git add file"}});
+        assert!(pending.enqueue(&request, &known, &HashMap::new()).unwrap());
+        let (tx, rx) = mpsc::sync_channel(10);
+        let writer = RpcWriter(tx);
+        pending.poll(&writer).unwrap();
+        assert!(rx.try_recv().is_err(), "No response before user decision");
+        let approval = mailbox.approvals().remove(0);
+        mailbox.decide_approval(&approval, true).unwrap();
+        assert!(mailbox.decide_approval(&approval, false).is_err());
+        pending.poll(&writer).unwrap();
+        let reply: Value = serde_json::from_slice(&rx.recv().unwrap()).unwrap();
+        assert_eq!(
+            reply,
+            json!({"id":"opaque/rpc-id","result":{"decision":"accept"}})
+        );
+        assert!(mailbox.approvals().is_empty());
+        assert!(mailbox.decide_approval(&approval, true).is_err());
+        assert!(pending.enqueue(&request, &known, &HashMap::new()).unwrap());
+        pending.resolve(&request["id"]);
+        assert!(mailbox.approvals().is_empty());
+        assert!(pending.enqueue(&request, &known, &HashMap::new()).unwrap());
+        drop(pending);
+        assert!(mailbox.approvals().is_empty());
+        let mut unknown = request.clone();
+        unknown["params"]["threadId"] = json!("foreign");
+        let mut pending =
+            PendingApprovals::new(mailbox.path().join("approvals"), *mailbox.approval_key());
+        assert!(!pending.enqueue(&unknown, &known, &HashMap::new()).unwrap());
+        unknown["params"]["threadId"] = json!(ROOT);
+        unknown["method"] = json!("item/tool/requestUserInput");
+        assert!(!pending.enqueue(&unknown, &known, &HashMap::new()).unwrap());
+        let invalid = ApprovalRequest {
+            request_id: "../escape".into(),
+            ..approval
+        };
+        assert!(mailbox.decide_approval(&invalid, true).is_err());
+    }
+
+    #[test]
+    fn forged_decisions_and_replaced_displayed_commands_cannot_authorize_execution() {
+        let mailbox = Mailbox::new().unwrap();
+        let mut pending =
+            PendingApprovals::new(mailbox.path().join("approvals"), *mailbox.approval_key());
+        let request = json!({"id":42,"method":"item/commandExecution/requestApproval","params":{"threadId":ROOT,"command":"git add sensitive.txt"}});
+        pending
+            .enqueue(&request, &HashSet::from([ROOT.into()]), &HashMap::new())
+            .unwrap();
+        let original = mailbox.approvals().remove(0);
+        let path = mailbox
+            .path()
+            .join("approvals")
+            .join(format!("{}.decision", original.request_id));
+        let (tx, rx) = mpsc::sync_channel(10);
+        let writer = RpcWriter(tx);
+        fs::write(&path, "true").unwrap();
+        pending.poll(&writer).unwrap();
+        assert!(rx.try_recv().is_err());
+        let mut displayed = original.clone();
+        displayed.params["command"] = json!("echo harmless");
+        assert!(
+            mailbox.decide_approval(&displayed, true).is_err(),
+            "Do not sign a replaced snapshot"
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec(&ApprovalDecision::signed(
+                mailbox.approval_key(),
+                &displayed,
+                true,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        pending.poll(&writer).unwrap();
+        assert!(rx.try_recv().is_err(), "MAC must bind original command");
+        let mut decision = ApprovalDecision::signed(mailbox.approval_key(), &original, false);
+        decision.accept = true;
+        fs::write(&path, serde_json::to_vec(&decision).unwrap()).unwrap();
+        pending.poll(&writer).unwrap();
+        assert!(rx.try_recv().is_err(), "Cannot flip a signed denial");
+        mailbox.decide_approval(&original, false).unwrap();
+        pending.poll(&writer).unwrap();
+        let result: Value = serde_json::from_slice(&rx.recv().unwrap()).unwrap();
+        assert_eq!(result["result"]["decision"], "decline");
+    }
+
+    #[test]
+    fn file_approval_requires_changes_from_the_same_thread() {
+        let mailbox = Mailbox::new().unwrap();
+        let mut pending =
+            PendingApprovals::new(mailbox.path().join("approvals"), *mailbox.approval_key());
+        let request = json!({"id":42,"method":"item/fileChange/requestApproval","params":{"threadId":ROOT,"itemId":"patch"}});
+        let known = HashSet::from([ROOT.into()]);
+        assert!(!pending.enqueue(&request, &known, &HashMap::new()).unwrap());
+        let item = json!({"type":"fileChange","changes":[{"path":"file.txt","diff":"+hello"}]});
+        let mut items = HashMap::from([(format!("{}:patch", json!("foreign")), item.clone())]);
+        assert!(!pending.enqueue(&request, &known, &items).unwrap());
+        items.insert(format!("{}:patch", json!(ROOT)), item.clone());
+        assert!(pending.enqueue(&request, &known, &items).unwrap());
+        assert_eq!(mailbox.approvals()[0].params["itemDetails"], item);
+    }
+
+    #[test]
+    fn mcp_approval_does_not_answer_forms_or_foreign_threads() {
+        let mailbox = Mailbox::new().unwrap();
+        let mut pending =
+            PendingApprovals::new(mailbox.path().join("approvals"), *mailbox.approval_key());
+        let known = HashSet::from([ROOT.into()]);
+        let request = json!({"id":"mcp", "method":"mcpServer/elicitation/request",
+            "params":{"threadId":ROOT, "mode":"form", "serverName":"tools",
+                "message":"Allow tool?", "requestedSchema":{"type":"object","properties":{}}}});
+        for (field, value) in [
+            ("threadId", json!("foreign")),
+            ("mode", json!("url")),
+            (
+                "requestedSchema",
+                json!({"type":"object","properties":{"name":{"type":"string"}}}),
+            ),
+            (
+                "requestedSchema",
+                json!({"type":"object","properties":{},"required":["name"]}),
+            ),
+            ("requestedSchema", Value::Null),
+        ] {
+            let mut invalid = request.clone();
+            invalid["params"][field] = value;
+            assert!(!pending.enqueue(&invalid, &known, &HashMap::new()).unwrap());
+            assert!(mailbox.approvals().is_empty());
+        }
+        assert!(pending.enqueue(&request, &known, &HashMap::new()).unwrap());
+        let approval = mailbox.approvals().remove(0);
+        assert_eq!(approval.params, request["params"]);
+        assert_eq!(
+            PendingApprovals::response(&approval, true),
+            json!({"action":"accept","content":{}})
+        );
+        assert_eq!(
+            PendingApprovals::response(&approval, false),
+            json!({"action":"decline","content":null})
+        );
+        pending.resolve(&json!("mcp"));
+        assert!(mailbox.approvals().is_empty());
+        assert!(mailbox.decide_approval(&approval, true).is_err());
+    }
+
+    #[test]
+    fn permissions_are_limited_to_requested_fields_and_current_turn() {
+        let request = ApprovalRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            method: "item/permissions/requestApproval".into(),
+            params: json!({"permissions":{"network":{"enabled":true},"fileSystem":null,"unrecognized":true}}),
+        };
+        assert_eq!(
+            PendingApprovals::response(&request, true),
+            json!({"permissions":{"network":{"enabled":true}},"scope":"turn"})
+        );
+        assert_eq!(
+            PendingApprovals::response(&request, false),
+            json!({"permissions":{},"scope":"turn"})
+        );
+        let request = ApprovalRequest {
+            method: "item/fileChange/requestApproval".into(),
+            ..request
+        };
+        assert_eq!(
+            PendingApprovals::response(&request, false),
+            json!({"decision":"decline"})
+        );
     }
 
     #[test]

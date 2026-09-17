@@ -99,6 +99,7 @@ impl Outcome {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Request<'a> {
     pub settings: &'a Settings,
     pub cwd: &'a Path,
@@ -119,6 +120,7 @@ pub struct Request<'a> {
 pub struct PreparedCommand {
     command: Command,
     _profile_files: Option<tempfile::TempDir>,
+    _bridge: Option<crate::mixed_runtime::Bridge>,
 }
 impl std::ops::Deref for PreparedCommand {
     type Target = Command;
@@ -133,21 +135,37 @@ impl std::ops::DerefMut for PreparedCommand {
 }
 
 pub fn command(request: &Request<'_>) -> Result<PreparedCommand> {
-    command_with_input(request, None)
+    command_with_input(request, None, None)
 }
 
-fn command_with_input(request: &Request<'_>, input_file: Option<&Path>) -> Result<PreparedCommand> {
+fn command_with_input(
+    request: &Request<'_>,
+    input_file: Option<&Path>,
+    control: Option<&crate::mixed_runtime::ChildControl>,
+) -> Result<PreparedCommand> {
     let mut command = Command::new(&request.settings.executable);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        if let Some(control) = control {
+            control.configure_child(&mut command)?;
+        } else {
+            command.process_group(0);
+        }
     }
     command.current_dir(request.cwd);
     let mut profile_files = None;
     if let Some(team) = request.team {
         team.validate()?;
     }
+    let mut native_request = *request;
+    let mixed = request.team.is_some_and(|team| team.is_mixed());
+    if mixed {
+        native_request.team = None;
+        native_request.delegates = false;
+    }
+    let original_request = request;
+    let request = &native_request;
     match request.settings.client {
         Backend::Claude => providers::claude::configure(&mut command, request)?,
         Backend::Cursor | Backend::Grok => {
@@ -157,6 +175,14 @@ fn command_with_input(request: &Request<'_>, input_file: Option<&Path>) -> Resul
             profile_files = providers::codex::configure(&mut command, request)?;
         }
     }
+    let bridge = if mixed {
+        Some(crate::mixed_runtime::Bridge::prepare(
+            original_request,
+            &mut command,
+        )?)
+    } else {
+        None
+    };
     command
         .env_remove(crate::activity::ENV_PATH)
         .env_remove(crate::agent_control::ENV_PATH)
@@ -166,6 +192,7 @@ fn command_with_input(request: &Request<'_>, input_file: Option<&Path>) -> Resul
     Ok(PreparedCommand {
         command,
         _profile_files: profile_files,
+        _bridge: bridge,
     })
 }
 
@@ -214,19 +241,30 @@ pub fn execute(
 /// Observers receive public CLI events and idle ticks without changing usage accounting.
 pub fn execute_with_events(
     request: Request<'_>,
+    progress: impl FnMut(&Outcome) -> Result<()>,
+    events: impl FnMut(Option<&str>),
+) -> Result<Outcome> {
+    execute_controlled(request, progress, events, None)
+}
+
+pub(crate) fn execute_controlled(
+    request: Request<'_>,
     mut progress: impl FnMut(&Outcome) -> Result<()>,
     mut events: impl FnMut(Option<&str>),
+    control: Option<&crate::mixed_runtime::ChildControl>,
 ) -> Result<Outcome> {
     ensure!(request.prompt.len() <= 1_000_000, "Prompt maior que 1 MB");
     if request.settings.client == Backend::Codex
-        && request.team.is_some()
+        && request.team.is_some_and(|team| !team.is_mixed())
         && request.image.is_none()
         && request.output_schema.is_none()
         && crate::agent_control::requested()
     {
         return crate::agent_control::execute(request, progress, events);
     }
-    if request.settings.client != Backend::Codex && request.team.is_some() {
+    if request.team.is_some_and(|team| team.is_mixed())
+        || (request.settings.client != Backend::Codex && request.team.is_some())
+    {
         crate::agent_control::unsupported(request.settings.client);
     }
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -247,14 +285,28 @@ pub fn execute_with_events(
             Backend::Cursor | Backend::Grok => providers::agent_cli::input(&request)?,
         }
     };
-    let mut prepared_command =
-        command_with_input(&request, prepared_input.as_ref().map(|file| file.path()))?;
-    let mut child = ChildGuard(prepared_command.spawn().with_context(|| {
+    let mut prepared_command = command_with_input(
+        &request,
+        prepared_input.as_ref().map(|file| file.path()),
+        control,
+    )?;
+    ensure!(
+        !control.is_some_and(|c| c.cancelled()),
+        "Subagente cancelado antes de iniciar"
+    );
+    let spawned = prepared_command.spawn().with_context(|| {
         format!(
             "Não foi possível iniciar {}",
             request.settings.executable.display()
         )
-    })?);
+    });
+    if spawned.is_err()
+        && let Some(control) = control
+    {
+        control.cleanup_unstarted();
+    }
+    let mut child = ChildGuard(spawned?);
+    let _registration = control.map(|c| c.register(child.0.id())).transpose()?;
     let mut stdin = child.0.stdin.take().context("stdin indisponível")?;
     let writer = std::thread::spawn(move || stdin.write_all(prompt.as_bytes()));
     let stdout = child.0.stdout.take().context("stdout indisponível")?;
@@ -270,8 +322,12 @@ pub fn execute_with_events(
     let deadline = Instant::now() + Duration::from_secs(request.timeout_secs);
     let mut next_notice = Instant::now() + Duration::from_secs(30);
     loop {
-        if Instant::now() >= deadline || interrupted.load(Ordering::Relaxed) {
-            outcome.interrupted = interrupted.load(Ordering::Relaxed);
+        if Instant::now() >= deadline
+            || interrupted.load(Ordering::Relaxed)
+            || control.is_some_and(|c| c.cancelled())
+        {
+            outcome.interrupted =
+                interrupted.load(Ordering::Relaxed) || control.is_some_and(|c| c.cancelled());
             outcome.timed_out = !outcome.interrupted;
             child.stop();
             break;

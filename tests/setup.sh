@@ -192,6 +192,7 @@ manifest="$prefix/share/stackpulse/install.manifest"
 [ "$("$binary" --version)" = 'stackpulse 0.1.0 A' ] || fail 'installed binary did not run'
 [ -f "$manifest" ] || fail 'install manifest is missing'
 [ "$(sed -n '1p' "$manifest")" = stackpulse-installer-v1 ] || fail 'install manifest has no ownership magic'
+[ "$(sed -n '3p' "$manifest")" = "$(CDPATH= cd -- "$repo" && pwd -P)" ] || fail 'install manifest did not record the canonical source directory'
 [ "$("$binary" 'prompt with spaces' '$(literal)' '`literal`')" = "$(printf '%s\n' 'prompt with spaces' '$(literal)' '`literal`')" ] || fail 'installed command changed arguments'
 [ ! -e "$elsewhere/injected-dollar" ] && [ ! -e "$elsewhere/injected-backtick" ] || fail 'install evaluated a path'
 expect_completion 'Preparado para novos terminais'

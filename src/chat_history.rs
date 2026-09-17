@@ -634,6 +634,33 @@ impl ChatHistory {
         Ok(self.document(id)?.session)
     }
 
+    /// Snapshot the persisted conversation, independent of the visible UI tail.
+    /// Call before starting the next turn so its request is included only once.
+    pub(crate) fn context(&self, id: &str) -> Result<String> {
+        let session = self.read_session(id)?;
+        let turns: Vec<_> = session
+            .turns
+            .iter()
+            // A preview contains the generated input, not an agent response.
+            .filter(|turn| !turn.status.starts_with("Prévia ·"))
+            .map(|turn| {
+                serde_json::json!({
+                    "user": turn.prompt,
+                    "assistant": turn.response.join("\n"),
+                    "status": turn.status,
+                    "profile": turn.profile,
+                })
+            })
+            .collect();
+        if turns.is_empty() {
+            return Ok(String::new());
+        }
+        Ok(serde_json::to_string(&serde_json::json!({
+            "session_id": session.summary.id,
+            "turns": turns,
+        }))?)
+    }
+
     pub(crate) fn export_session(&self, id: &str, destination: &Path) -> Result<()> {
         let document = self.document(id)?;
         let parent = destination.parent().context("Destino inválido")?;
@@ -834,7 +861,11 @@ fn apply(document: &mut Document, event: &Event) -> Result<()> {
             for turn in &mut document.session.turns {
                 if turn.ended_at.is_none() {
                     turn.ended_at = Some(*at);
-                    turn.status = INTERRUPTED.into();
+                    turn.status = if turn.status.starts_with("Prévia ·") {
+                        format!("Prévia · {INTERRUPTED}")
+                    } else {
+                        INTERRUPTED.into()
+                    };
                 }
             }
         }

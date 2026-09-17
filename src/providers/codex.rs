@@ -40,6 +40,18 @@ pub(crate) fn configure_app_server(
 }
 
 fn configure_overrides(command: &mut Command, request: &Request<'_>) -> Result<Option<TempDir>> {
+    if request.sandbox == "danger-full-access" {
+        override_value(
+            command,
+            "approval_policy",
+            toml::Value::String("never".into()),
+        );
+        override_value(
+            command,
+            "sandbox_mode",
+            toml::Value::String(request.sandbox.into()),
+        );
+    }
     for (key, value) in [
         ("model_provider", request.provider),
         ("model_reasoning_effort", request.effort),

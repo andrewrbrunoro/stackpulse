@@ -57,6 +57,7 @@ fn option<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn team() -> TeamSpec {
     let root = AgentSpec {
+        provider: None,
         role: "coordinator".into(),
         model: "claude-root-example".into(),
         effort: "medium".into(),
@@ -69,6 +70,7 @@ fn team() -> TeamSpec {
         orchestrator: root.clone(),
         agents: vec![
             AgentSpec {
+                provider: None,
                 role: "reviewer".into(),
                 model: "claude-review-example".into(),
                 effort: "high".into(),
@@ -76,6 +78,7 @@ fn team() -> TeamSpec {
                 when: "quando houver alterações\ncom testes".into(),
             },
             AgentSpec {
+                provider: None,
                 role: "researcher".into(),
                 model: "default".into(),
                 effort: "default".into(),
@@ -181,6 +184,7 @@ fn oversized_claude_role_contract_fails_without_truncation() {
     let role = team.agents[0].clone();
     team.agents = (0..32)
         .map(|index| AgentSpec {
+            provider: None,
             role: format!("role_{index}"),
             purpose: "a".repeat(4_000),
             when: "b".repeat(2_000),

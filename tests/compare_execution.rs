@@ -23,6 +23,7 @@ fn profile(root: &Path, name: &str, model: &str) {
             name: name.into(),
             provider: "openai".into(),
             orchestrator: AgentSpec {
+                provider: None,
                 role: "root".into(),
                 model: model.into(),
                 effort: "low".into(),

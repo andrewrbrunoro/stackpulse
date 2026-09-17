@@ -50,6 +50,7 @@ fn has_pair(args: &[String], key: &str, value: &str) -> bool {
 
 fn selected_team(provider: &str) -> TeamSpec {
     let root = AgentSpec {
+        provider: None,
         role: "coordinator".into(),
         model: "default".into(),
         effort: "default".into(),
@@ -61,6 +62,7 @@ fn selected_team(provider: &str) -> TeamSpec {
         provider: provider.into(),
         orchestrator: root.clone(),
         agents: vec![AgentSpec {
+            provider: None,
             role: "reviewer".into(),
             model: "explicit-child-model".into(),
             effort: "high".into(),
@@ -353,4 +355,19 @@ fn cursor_image_is_explicit_read_tool_context_and_schema_is_in_prompt() {
     assert!(prompt.contains(image.file_name().unwrap().to_str().unwrap()));
     assert!(prompt.contains(r#"{"type":"object"}"#));
     assert!(agent_cli::prompt_file(&req).unwrap().is_none());
+}
+
+#[test]
+fn grok_full_access_disables_both_permission_prompts_and_sandbox() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = settings(Backend::Grok, dir.path());
+    let mut req = request(&settings, dir.path());
+    req.sandbox = "danger-full-access";
+    let mut command = Command::new("not-executed");
+    agent_cli::configure(&mut command, &req).unwrap();
+    let args = args(&command);
+    assert!(has_pair(&args, "--permission-mode", "bypassPermissions"));
+    assert!(has_pair(&args, "--sandbox", "off"));
+    assert!(args.contains(&"--no-subagents".into()));
+    assert!(!args.contains(&"--allow".into()));
 }

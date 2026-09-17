@@ -10,7 +10,7 @@ use ai_token_timeline::{
     profiles::{self, Settings},
     setup_flow, setup_ui, trend,
     ui_data::Page,
-    usagebar, widget, workflow,
+    update, usagebar, widget, workflow,
     workspace::Workspace,
 };
 use anyhow::{Context, Result, ensure};
@@ -27,6 +27,13 @@ use std::path::PathBuf;
     about = "Widget de tokens, custo e tempo de agentes no terminal"
 )]
 struct Cli {
+    #[arg(
+        long,
+        visible_aliases = ["skip-dangerous", "dangerously-skip-permissions"],
+        global = true,
+        help = "Inicia Codex/Grok sem sandbox nem pedidos de aprovação (somente nesta execução)"
+    )]
+    no_policy: bool,
     #[arg(
         long,
         global = true,
@@ -123,6 +130,15 @@ enum Command {
     },
     /// Configura o auxiliar que interpreta imagens e a pasta de perfis.
     Setup(Setup),
+    /// Recompila as fontes locais e atualiza a instalação preservando as configurações.
+    Update {
+        #[arg(
+            long,
+            value_name = "DIR",
+            help = "Pasta das fontes, caso o clone tenha sido movido"
+        )]
+        source: Option<PathBuf>,
+    },
     /// Instala a memória opcional AI-Memory, criada por Fabio Akita.
     Memory {
         #[command(subcommand)]
@@ -147,6 +163,9 @@ enum Command {
     /// Executa um pedido usando o perfil da pasta e salva stack, consumo e tempo.
     Run {
         prompt: String,
+        /// Internal transport for the active chat's transcript.
+        #[arg(long, hide = true)]
+        chat_context: Option<PathBuf>,
         #[arg(long)]
         profile: Option<String>,
         #[arg(long, default_value = "")]
@@ -714,7 +733,13 @@ fn switch_client(settings: &mut Settings, client: Backend) {
 }
 
 fn main() -> Result<()> {
+    if let Some(result) = ai_token_timeline::mixed_runtime::internal_entry() {
+        return result;
+    }
     let cli = Cli::parse();
+    if let Some(Command::Update { source }) = &cli.command {
+        return update::run(source.as_deref());
+    }
     let workspace = Workspace::current()?;
     if !workspace.authorize(cli.allow_workspace.as_deref())? {
         eprintln!("Acesso cancelado. Nenhum comando foi executado.");
@@ -821,6 +846,7 @@ fn main() -> Result<()> {
                 sessions,
                 timezone: cli.timezone,
                 page: page.unwrap_or(Page::Run),
+                no_policy: cli.no_policy,
             };
             if page.is_none() || page == Some(Page::Run) {
                 chat_ui::run(&mut db, options)?;
@@ -829,6 +855,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Setup(_)
+        | Command::Update { .. }
         | Command::Memory { .. }
         | Command::Usagebar { .. }
         | Command::Plugins { .. } => {
@@ -910,6 +937,7 @@ fn main() -> Result<()> {
         }
         Command::Run {
             prompt,
+            chat_context,
             profile,
             benchmark,
             sandbox,
@@ -917,12 +945,36 @@ fn main() -> Result<()> {
             dry_run,
             no_feedback,
         } => {
+            let context = if let Some(path) = chat_context {
+                use std::io::Read;
+                let mut context = String::new();
+                std::fs::File::open(&path)
+                    .with_context(|| format!("Histórico indisponível: {}", path.display()))?
+                    .take(1_000_001)
+                    .read_to_string(&mut context)
+                    .context("Não foi possível ler o histórico da conversa")?;
+                ensure!(
+                    context.len() <= 1_000_000,
+                    "Histórico excede o limite de entrada de 1 MB; use /new para iniciar outra conversa. O histórico foi preservado."
+                );
+                if !context.is_empty() {
+                    let value: serde_json::Value = serde_json::from_str(&context)
+                        .context("Arquivo de contexto do chat contém JSON inválido")?;
+                    ensure!(
+                        value["session_id"].is_string() && value["turns"].is_array(),
+                        "Arquivo de contexto do chat inválido: sessão e turnos ausentes"
+                    );
+                }
+                context
+            } else {
+                String::new()
+            };
             let settings = Settings::read(&config_path)?;
             let selected = profiles::resolve(&settings, &cwd, profile.as_deref())?;
             if !selected.compiled && !dry_run {
                 workflow::compile(&settings, &selected.path, 300, false)?;
             }
-            if let Some(job) = workflow::run(
+            if let Some(job) = workflow::run_with_context(
                 &mut db,
                 &settings,
                 workflow::RunOptions {
@@ -931,11 +983,16 @@ fn main() -> Result<()> {
                     profile: profile.as_deref(),
                     prompt: &prompt,
                     benchmark: &benchmark,
-                    sandbox: &sandbox,
+                    sandbox: if cli.no_policy {
+                        "danger-full-access"
+                    } else {
+                        &sandbox
+                    },
                     timeout_secs: timeout,
                     dry_run,
                     no_feedback,
                 },
+                &context,
             )? {
                 ensure!(
                     job.status == "completed",

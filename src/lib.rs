@@ -7,6 +7,7 @@ pub(crate) mod chat_agents;
 pub(crate) mod chat_composer;
 pub(crate) mod chat_history;
 pub(crate) mod chat_metrics;
+pub(crate) mod chat_preview;
 pub(crate) mod chat_profiles;
 pub(crate) mod chat_tabs;
 pub mod chat_ui;
@@ -32,7 +33,10 @@ pub(crate) mod tui;
 pub(crate) mod ui_commands;
 pub mod ui_data;
 pub(crate) mod ui_job;
+pub mod update;
 pub mod usagebar;
 pub mod widget;
 pub mod workflow;
 pub mod workspace;
+
+pub mod mixed_runtime;
