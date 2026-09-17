@@ -1,6 +1,8 @@
 # StackPulse
 
-Interface de pedidos e widget pequeno para o terminal, escritos em **Rust**, com histórico de conversas em JSONL e métricas locais em SQLite. Escolha uma equipe e envie pedidos em uma tela de chat. Executa com **Codex CLI, Claude Code, Cursor Agent e Grok CLI**, reutilizando o login existente de cada client. Registra tokens, tempo, configuração e feedback. Para Codex, também importa os logs locais e soma orquestrador + subagentes observados.
+Chat de terminal em **Rust** para executar pedidos com **Codex CLI, Claude Code, Cursor Agent e Grok CLI**, reutilizando o login de cada client. Escolha um perfil de equipe, converse em abas e acompanhe os subagentes, tokens, tempo e feedback. Equipes multiprovedor combinam um orquestrador Codex ou Claude com papéis executados pelos CLIs configurados em uma ponte MCP.
+
+O histórico de conversas fica em JSONL e as métricas locais em SQLite. Para Codex, o StackPulse também importa logs locais e soma o uso observado do orquestrador e dos subagentes. No chat Codex, **Ctrl+Y/Ctrl+N** respondem aos pedidos de autorização. Para iniciar Codex/Grok sem sandbox nem aprovações, use `stackpulse --skip-dangerous`; no chat, `/skip-dangerous` ativa esse modo para os próximos pedidos e `/skip-dangerous off` restaura as permissões configuradas.
 
 Também oferece **imagem → perfil Markdown → execução → feedback → tendência diária**. Veja o [guia de equipes por imagem](docs/image-workflows.md) para configurar o auxiliar, usar a imagem de exemplo e executar pedidos no projeto.
 
@@ -164,6 +166,20 @@ stackpulse ui
 stackpulse ui run
 ```
 
+Para iniciar o chat Codex/Grok sem sandbox e sem pedidos de aprovação:
+
+```sh
+stackpulse --no-policy
+# Aliases equivalentes:
+stackpulse --skip-dangerous
+stackpulse --dangerously-skip-permissions
+# Também aceita uma chamada explícita:
+stackpulse --no-policy ui
+stackpulse --no-policy run "Implemente a alteração"
+```
+
+`--no-policy` é uma opção global desta chamada. Vale para os pedidos do chat e `run` nesta execução, incluindo os filhos da ponte multiprovedor. Codex recebe `danger-full-access` e aprovação `never`; Grok recebe `bypassPermissions` e sandbox `off`. Claude/Cursor ainda rejeitam esse modo. A opção não é salva, não remove políticas administradas ou permissões do sistema e não modifica sessões já abertas. Sem ela, permanece o comportamento padrão, com aprovação `on-request` no chat Codex. A autorização inicial da pasta continua necessária.
+
 Antes de ler a configuração, os perfis ou o histórico, o StackPulse mostra **Permitir acesso à pasta?** com o caminho completo da pasta atual. Use ↑/↓ ou `Tab` para selecionar **Permitir nesta sessão** e `Enter` para confirmar. **Cancelar** começa selecionado; `Esc` e `Ctrl+C` também encerram sem executar comandos nem criar configuração ou banco. A autorização vale até sair do programa, incluindo os comandos abertos pelo chat e pelo painel. Ao iniciar novamente, a confirmação reaparece.
 
 Os pedidos executam na pasta em que você chamou `stackpulse`, inclusive em subpastas de um repositório. O local de instalação não muda esse contexto. A raiz Git serve apenas para encontrar o perfil do projeto; o executor e o registro de métricas mantêm a pasta atual. Um caminho simbólico é resolvido para sua pasta real, exibida na confirmação.
@@ -216,9 +232,9 @@ Os subagentes observados aparecem em cartões à direita, com **tarefa, modelo/e
 
 As execuções Codex iniciadas pela UI usam um **app-server privado por pedido**, com o login e as permissões da execução. As orientações seguem sempre pelo orquestrador, responsável por encaminhá-las ao agente escolhido. **Orquestrador notificado** e **Aguardando repasse** são estados intermediários; a confirmação exige um evento nativo correlacionado ao destino e à orientação enviada. O redirecionamento exige confirmação da interrupção e do repasse. Nos demais adaptadores, essas intervenções aparecem como indisponíveis. O histórico do chat salva o último snapshot de atividade e as intervenções por pedido. Veja [os controles e seus limites](docs/terminal-interface.md#acompanhar-os-subagentes).
 
-No chat Codex, cada pedido inicia com política de aprovação `on-request`, mantendo o sandbox escolhido em `/options`. Quando o runtime precisar de autorização, o chat mostra a ação, o motivo e os detalhes: **Ctrl+Y** aprova e **Ctrl+N** nega. ↑/↓ e PageUp/PageDown percorrem detalhes longos. A aprovação vale para aquela ação; pedidos de permissões adicionais valem somente pelo turno indicado. Fechar ou interromper a execução não concede autorização. Outros adaptadores e comandos sem chat mantêm suas políticas próprias. A mudança exige uma nova execução do StackPulse atualizado; não altera sessões já iniciadas.
+No chat Codex, cada pedido inicia com política de aprovação `on-request`, mantendo o sandbox escolhido em `/options`, salvo `--no-policy` ou `/skip-dangerous` nesta execução. Quando o runtime precisar de autorização, o chat mostra a ação, o motivo e os detalhes: **Ctrl+Y** aprova e **Ctrl+N** nega. ↑/↓ e PageUp/PageDown percorrem detalhes longos. Confirmações simples de ferramentas MCP também aparecem nesse painel e autorizam somente aquela chamada; formulários com campos e fluxos por URL não são respondidos por ele. A aprovação vale para aquela ação; pedidos de permissões adicionais valem somente pelo turno indicado. Fechar ou interromper a execução não concede autorização. Outros adaptadores e comandos sem chat mantêm suas políticas próprias. A mudança exige uma nova execução do StackPulse atualizado; não altera sessões já iniciadas.
 
-Use `/profile` para trocar a equipe, `/options` para ajustar benchmark, permissões e limite de tempo, e `/feedback` para avaliar o pedido selecionado e concluído. `/preview seu pedido` mostra a prévia. `/sessions` lista as conversas salvas deste projeto: selecioná-las foca a aba já aberta ou abre outra, sem reexecutar pedidos. `/new` abre uma nova aba. `/history`, `/trend` e `/report` abrem as métricas e os relatórios; `/help` lista os comandos. Digite `/` e use ↑/↓ e `Tab` para completar uma sugestão.
+Use `/profile` para trocar a equipe, `/options` para ajustar benchmark, permissões e limite de tempo, e `/feedback` para avaliar o pedido selecionado e concluído. `/skip-dangerous [on|off]` (aliases `/no-policy` e `/dangerously-skip-permissions`) ativa, sem argumento ou com `on`, o modo sem sandbox/aprovações para os próximos pedidos Codex/Grok em todas as abas; `off` restaura as permissões configuradas. Não altera execuções já iniciadas nem persiste ao fechar o aplicativo. `/preview seu pedido` mostra a prévia. `/sessions` lista as conversas salvas deste projeto: selecioná-las foca a aba já aberta ou abre outra, sem reexecutar pedidos. `/new` abre uma nova aba. `/history`, `/trend` e `/report` abrem as métricas e os relatórios; `/help` lista os comandos. Digite `/` e use ↑/↓ e `Tab` para completar uma sugestão.
 
 Respostas com blocos Mermaid completos são detectadas ao término do pedido e abrem automaticamente no navegador, com Markdown e diagramas renderizados. Não é necessário digitar um comando. O texto permanece no terminal; o caminho do HTML aparece no final da conversa. A visualização requer internet para carregar as bibliotecas. Reabrir o histórico não abre o navegador novamente.
 
@@ -279,7 +295,7 @@ cargo run --release -- runs --json
 
 Após `./setup.sh`, `stackpulse` abre a confirmação, o seletor e o chat; `stackpulse widget` abre somente o widget após a confirmação. Para desenvolvimento, os comandos `cargo run --release -- ...` continuam disponíveis na pasta dos fontes.
 
-Em scripts, redirecionamentos e status de terminal, informe `--allow-workspace "$PWD"`. Essa opção global autoriza somente a pasta atual exata para aquela chamada; um caminho de pai, filho ou outro projeto é recusado. Sem terminal e sem essa opção, o programa encerra antes de acessar a configuração ou abrir o banco. `--help` e `--version` dispensam autorização. Sem subcomando, `stackpulse --allow-workspace "$PWD"` mantém a saída textual do widget quando redirecionado.
+Em scripts, redirecionamentos e status de terminal, informe `--allow-workspace "$PWD"`. Essa opção global autoriza somente a pasta atual exata para aquela chamada; um caminho de pai, filho ou outro projeto é recusado. Sem terminal e sem essa opção, o programa encerra antes de acessar a configuração ou abrir o banco. `--help` e `--version` dispensam autorização. Sem subcomando, `stackpulse --allow-workspace "$PWD"` mantém a saída textual do widget quando redirecionado. `--no-policy`, `--skip-dangerous` e `--dangerously-skip-permissions` também são globais e aplicam o modo sem sandbox/aprovações a `ui` e `run` nesta chamada, com o mesmo escopo e limites descritos acima.
 
 Um status de tmux pode consultar o banco com `#(stackpulse --allow-workspace "$PWD" widget --line --no-sync)`, usando a pasta atual do processo de status do tmux. Nesse modo é necessário manter um widget coletando ou executar `sync` para atualizar o banco. Não há serviço instalado em segundo plano.
 
